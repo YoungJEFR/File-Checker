@@ -2,78 +2,75 @@ package org.example;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.Scanner;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 
 public class Main {
 
     public static void main(String[] args) {
-        Scanner in = new Scanner(System.in);
 
-        Path path;
+        Scanner scanner = new Scanner(System.in);
 
-        System.out.println("Введите путь к папке или EXIT для выхода:");
+        System.out.println("Введите путь к папке:");
 
-        while (true) {
-            String input = in.nextLine();
+        Path root = Path.of(scanner.nextLine());
 
-            if (input.equalsIgnoreCase("EXIT")) {
-                return;
-            }
+        if (!Files.exists(root) || !Files.isDirectory(root)) {
+            System.out.println("Папка не найдена");
+            return;
+        }
 
-            path = Path.of(input);
+        int workerCount = 3;
 
-            if (Files.exists(path) && Files.isDirectory(path)) {
-                break;
-            }
+        BlockingQueue<FileTask> queue =
+                new ArrayBlockingQueue<>(3);
 
-            System.out.println("Такой папки нет. Попробуйте снова:");
+        FileProducer producer =
+                new FileProducer(root, queue);
+
+        Thread producerThread =
+                new Thread(producer, "Producer");
+
+
+        Thread[] workers = new Thread[workerCount];
+
+        for (int i = 0; i < workerCount; i++) {
+
+            FileWorker worker =
+                    new FileWorker(queue);
+
+            workers[i] = new Thread(
+                    worker,
+                    "Worker-" + (i + 1)
+            );
+
+            workers[i].start();
         }
 
 
-        FileScanner fileScanner = new FileScanner(path);
-
-        List<FileInfo> oldFiles = fileScanner.scanFile();
-
-        System.out.println("\nПервое сканирование завершено.");
-        System.out.println("Всего файлов: " + oldFiles.size());
-
-        for (FileInfo fileInfo : oldFiles) {
-            System.out.println(fileInfo);
-        }
+        producerThread.start();
 
 
-        System.out.println("""
-                
-                Теперь измени файлы в папке:
-                - создай файл
-                - измени файл
-                - удали файл
-                
-                После этого нажми ENTER.
-                """);
+        try {
+            producerThread.join();
 
-        in.nextLine();
-
-
-        List<FileInfo> newFiles = fileScanner.scanFile();
-
-
-        FileChangeDetector detector = new FileChangeDetector();
-
-        List<FileChange> changes =
-                detector.detectChanges(oldFiles, newFiles);
-
-        System.out.println("\nНайдено изменений: " + changes.size());
-
-        if (changes.isEmpty()) {
-            System.out.println("Изменений нет.");
-        } else {
-            for (FileChange change : changes) {
-                System.out.println(change);
+            for (int i = 0; i < workerCount; i++) {
+                queue.put(
+                        new FileTask(Path.of("STOP"))
+                );
             }
-        }
 
-        in.close();
+            for (Thread worker : workers) {
+                worker.join();
+            }
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        System.out.println("Все файлы обработаны.");
+
+        scanner.close();
     }
 }
