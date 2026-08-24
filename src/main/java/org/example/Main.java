@@ -1,23 +1,18 @@
 package org.example;
 
-import com.formdev.flatlaf.FlatDarkLaf;
-
-import javax.swing.*;
-import java.awt.*;
-import java.io.File;
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Scanner;
-import java.util.stream.Stream;
 
 public class Main {
-    static void main() throws IOException {
+
+    public static void main(String[] args) {
         Scanner in = new Scanner(System.in);
+
         Path path;
+
+        System.out.println("Введите путь к папке или EXIT для выхода:");
 
         while (true) {
             String input = in.nextLine();
@@ -26,7 +21,7 @@ public class Main {
                 return;
             }
 
-            path = Paths.get(input);
+            path = Path.of(input);
 
             if (Files.exists(path) && Files.isDirectory(path)) {
                 break;
@@ -35,15 +30,50 @@ public class Main {
             System.out.println("Такой папки нет. Попробуйте снова:");
         }
 
+
         FileScanner fileScanner = new FileScanner(path);
 
-        List<FileInfo> allFiles = fileScanner.scanFile();
+        List<FileInfo> oldFiles = fileScanner.scanFile();
 
-        System.out.println("Всего файлов: " + allFiles.size());
+        System.out.println("\nПервое сканирование завершено.");
+        System.out.println("Всего файлов: " + oldFiles.size());
 
-        for (FileInfo fileInfo : allFiles) {
+        for (FileInfo fileInfo : oldFiles) {
             System.out.println(fileInfo);
         }
 
+
+        System.out.println("""
+                
+                Теперь измени файлы в папке:
+                - создай файл
+                - измени файл
+                - удали файл
+                
+                После этого нажми ENTER.
+                """);
+
+        in.nextLine();
+
+
+        List<FileInfo> newFiles = fileScanner.scanFile();
+
+
+        FileChangeDetector detector = new FileChangeDetector();
+
+        List<FileChange> changes =
+                detector.detectChanges(oldFiles, newFiles);
+
+        System.out.println("\nНайдено изменений: " + changes.size());
+
+        if (changes.isEmpty()) {
+            System.out.println("Изменений нет.");
+        } else {
+            for (FileChange change : changes) {
+                System.out.println(change);
+            }
+        }
+
+        in.close();
     }
 }
