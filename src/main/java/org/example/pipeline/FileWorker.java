@@ -2,6 +2,8 @@ package org.example.pipeline;
 
 import org.example.model.FileInfo;
 import org.example.model.FileTask;
+import org.example.model.FilesStat;
+import org.example.processor.FileProcessor;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -13,11 +15,12 @@ public class FileWorker implements Runnable {
 
     private final BlockingQueue<FileTask> queue;
     private final ConcurrentHashMap<Path, FileInfo> indexMap;
+    private final FilesStat filesStat;
 
-
-    public FileWorker(BlockingQueue<FileTask> queue, ConcurrentHashMap<Path, FileInfo> indexMap) {
+    public FileWorker(BlockingQueue<FileTask> queue, ConcurrentHashMap<Path, FileInfo> indexMap,  FilesStat filesStat) {
         this.queue = queue;
         this.indexMap = indexMap;
+        this.filesStat = filesStat;
     }
 
     @Override
@@ -36,16 +39,11 @@ public class FileWorker implements Runnable {
                     return;
                 }
 
-                Path path = fileTask.path();
+                FileInfo fileInfo = FileProcessor.process(fileTask);
 
-                FileInfo fileInfo = new FileInfo(
-                        Files.getLastModifiedTime(path),
-                        path.getFileName().toString(),
-                        Files.size(path),
-                        path
-                );
-
-                indexMap.put(path, fileInfo);
+                filesStat.getCountFiles().incrementAndGet();
+                filesStat.getCountByteFiles().add(fileInfo.fileSize());
+                indexMap.put(fileInfo.path(), fileInfo);
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -53,6 +51,7 @@ public class FileWorker implements Runnable {
 
             } catch (IOException e) {
                 e.printStackTrace();
+                filesStat.getErrorFiles().incrementAndGet();
             }
         }
     }

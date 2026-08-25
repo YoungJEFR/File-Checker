@@ -2,6 +2,7 @@ package org.example;
 
 import org.example.model.FileInfo;
 import org.example.model.FileTask;
+import org.example.model.FilesStat;
 import org.example.pipeline.FileProducer;
 import org.example.pipeline.FileWorker;
 
@@ -11,6 +12,8 @@ import java.util.Scanner;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 
 public class Main {
 
@@ -27,7 +30,10 @@ public class Main {
             return;
         }
 
-
+        AtomicInteger countFile = new AtomicInteger(0);
+        AtomicInteger errorFiles = new AtomicInteger(0);
+        LongAdder countByteFiles = new LongAdder();
+        FilesStat filesStat = new FilesStat(countFile, errorFiles, countByteFiles);
         ConcurrentHashMap<Path, FileInfo> indexMap = new ConcurrentHashMap<>();
 
         int workerCount = 3;
@@ -47,7 +53,7 @@ public class Main {
         for (int i = 0; i < workerCount; i++) {
 
             FileWorker worker =
-                    new FileWorker(queue, indexMap);
+                    new FileWorker(queue, indexMap, filesStat);
 
             workers[i] = new Thread(
                     worker,
@@ -79,7 +85,10 @@ public class Main {
             return;
         }
 
-        System.out.println("Всего файлов: " + indexMap.size());
+        System.out.println("Успешно обработанных файлов: " + filesStat.getCountFiles() + "\n" +
+                " | Ошибок: " +  filesStat.getErrorFiles() + "\n" +
+                " | Всего количество байт: " +  filesStat.getCountByteFiles());
+
         indexMap.forEach((path, fileInfo) -> {
             System.out.println(path + " : " + fileInfo);
         });
