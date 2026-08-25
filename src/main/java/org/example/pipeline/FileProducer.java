@@ -1,11 +1,10 @@
-package org.example;
+package org.example.pipeline;
 
-import java.io.File;
+import org.example.model.FileTask;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Iterator;
-import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.stream.Stream;
 

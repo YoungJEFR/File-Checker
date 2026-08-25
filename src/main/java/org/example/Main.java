@@ -1,10 +1,16 @@
 package org.example;
 
+import org.example.model.FileInfo;
+import org.example.model.FileTask;
+import org.example.pipeline.FileProducer;
+import org.example.pipeline.FileWorker;
+
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Scanner;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class Main {
 
@@ -20,6 +26,9 @@ public class Main {
             System.out.println("Папка не найдена");
             return;
         }
+
+
+        ConcurrentHashMap<Path, FileInfo> indexMap = new ConcurrentHashMap<>();
 
         int workerCount = 3;
 
@@ -38,7 +47,7 @@ public class Main {
         for (int i = 0; i < workerCount; i++) {
 
             FileWorker worker =
-                    new FileWorker(queue);
+                    new FileWorker(queue, indexMap);
 
             workers[i] = new Thread(
                     worker,
@@ -69,6 +78,12 @@ public class Main {
             Thread.currentThread().interrupt();
             return;
         }
+
+        System.out.println("Всего файлов: " + indexMap.size());
+        indexMap.forEach((path, fileInfo) -> {
+            System.out.println(path + " : " + fileInfo);
+        });
+
         System.out.println("Все файлы обработаны.");
 
         scanner.close();

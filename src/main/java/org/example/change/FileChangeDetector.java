@@ -1,4 +1,8 @@
-package org.example;
+package org.example.change;
+
+import org.example.model.ChangeType;
+import org.example.model.FileChange;
+import org.example.model.FileInfo;
 
 import java.nio.file.Path;
 import java.util.ArrayList;

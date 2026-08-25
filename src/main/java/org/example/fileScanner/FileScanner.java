@@ -1,4 +1,6 @@
-package org.example;
+package org.example.fileScanner;
+
+import org.example.model.FileInfo;
 
 import java.io.IOException;
 import java.nio.file.Files;

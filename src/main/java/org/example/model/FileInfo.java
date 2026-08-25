@@ -1,4 +1,4 @@
-package org.example;
+package org.example.model;
 
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;

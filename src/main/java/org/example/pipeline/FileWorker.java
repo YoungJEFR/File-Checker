@@ -1,16 +1,23 @@
-package org.example;
+package org.example.pipeline;
+
+import org.example.model.FileInfo;
+import org.example.model.FileTask;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class FileWorker implements Runnable {
 
     private final BlockingQueue<FileTask> queue;
+    private final ConcurrentHashMap<Path, FileInfo> indexMap;
 
-    public FileWorker(BlockingQueue<FileTask> queue) {
+
+    public FileWorker(BlockingQueue<FileTask> queue, ConcurrentHashMap<Path, FileInfo> indexMap) {
         this.queue = queue;
+        this.indexMap = indexMap;
     }
 
     @Override
@@ -38,12 +45,7 @@ public class FileWorker implements Runnable {
                         path
                 );
 
-                System.out.println(
-                        "Поток: "
-                                + Thread.currentThread().getName()
-                                + " | Обработал: "
-                                + fileInfo
-                );
+                indexMap.put(path, fileInfo);
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
