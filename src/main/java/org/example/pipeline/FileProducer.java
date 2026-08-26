@@ -30,6 +30,10 @@ public class FileProducer implements Runnable{
             while (iterator.hasNext()){
                 Path file = iterator.next();
 
+                if(Thread.currentThread().isInterrupted()){
+                    return;
+                }
+
                 try{
                     queue.put(new FileTask(file));
                 } catch (InterruptedException e){
