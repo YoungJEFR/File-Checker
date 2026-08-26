@@ -10,7 +10,7 @@ import java.util.stream.Stream;
 
 public class FileProducer implements Runnable{
     private final Path path;
-    private BlockingQueue<FileTask> queue;
+    private final BlockingQueue<FileTask> queue;
 
     public FileProducer(Path path, BlockingQueue<FileTask> queue) {
         this.path = path;
@@ -19,27 +19,28 @@ public class FileProducer implements Runnable{
 
     @Override
     public void run() {
+        while (!Thread.currentThread().isInterrupted()) {
+            try (Stream<Path> stream = Files.walk(path)) {
 
-        try (Stream<Path> stream = Files.walk(path)) {
+                var iterator = stream
+                        .filter(Files::isRegularFile)
+                        .filter(path1 -> path1.toString().endsWith(".md"))
+                        .iterator();
 
-            var iterator = stream
-                    .filter(Files::isRegularFile)
-                    .filter(path1 -> path1.toString().endsWith(".md"))
-                    .iterator();
+                while (iterator.hasNext()) {
+                    Path file = iterator.next();
 
-            while (iterator.hasNext()){
-                Path file = iterator.next();
-
-                try{
-                    queue.put(new FileTask(file));
-                } catch (InterruptedException e){
-                    Thread.currentThread().interrupt();
-                    return;
+                    try {
+                        queue.put(new FileTask(file));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
                 }
-            }
 
-        } catch (IOException e) {
-            e.printStackTrace();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
     }
 }
