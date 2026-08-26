@@ -1,5 +1,6 @@
 package org.example.pipeline;
 
+import org.example.model.ChangeType;
 import org.example.model.FileInfo;
 import org.example.model.FileTask;
 import org.example.model.FilesStat;
@@ -39,12 +40,39 @@ public class FileWorker implements Runnable {
                     return;
                 }
 
-                FileInfo fileInfo = FileProcessor.process(fileTask);
+                if (fileTask.changeType() == ChangeType.DELETED) {
+                    FileInfo removed = indexMap.remove(fileTask.path());
 
-                filesStat.getCountFiles().incrementAndGet();
-                filesStat.getCountByteFiles().add(fileInfo.fileSize());
-                indexMap.put(fileInfo.path(), fileInfo);
+                    if (removed != null) {
+                        filesStat.getCountByteFiles().add(-removed.fileSize());
+                        filesStat.getCountFiles().decrementAndGet();
+                    }
 
+                    continue;
+                }
+                if (fileTask.changeType() == ChangeType.MODIFIED) {
+                    FileInfo oldFile = indexMap.get(fileTask.path());
+                    FileInfo newFile = FileProcessor.process(fileTask);
+
+                    if (oldFile != null) {
+                        long difference = newFile.fileSize() - oldFile.fileSize();
+                        filesStat.getCountByteFiles().add(difference);
+                    }
+
+                    indexMap.put(newFile.path(), newFile);
+
+                    continue;
+                }
+                if (fileTask.changeType() == ChangeType.CREATED) {
+                    FileInfo fileInfo = FileProcessor.process(fileTask);
+
+                    FileInfo old = indexMap.put(fileInfo.path(), fileInfo);
+
+                    if (old == null) {
+                        filesStat.getCountFiles().incrementAndGet();
+                        filesStat.getCountByteFiles().add(fileInfo.fileSize());
+                    }
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
