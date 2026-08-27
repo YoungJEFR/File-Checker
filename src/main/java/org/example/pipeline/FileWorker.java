@@ -4,24 +4,26 @@ import org.example.model.ChangeType;
 import org.example.model.FileInfo;
 import org.example.model.FileTask;
 import org.example.model.FilesStat;
+import org.example.processor.FileIndex;
 import org.example.processor.FileProcessor;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class FileWorker implements Runnable {
 
     private final BlockingQueue<FileTask> queue;
-    private final ConcurrentHashMap<Path, FileInfo> indexMap;
     private final FilesStat filesStat;
+    private final FileIndex fileIndex;
 
-    public FileWorker(BlockingQueue<FileTask> queue, ConcurrentHashMap<Path, FileInfo> indexMap,  FilesStat filesStat) {
+    public FileWorker(
+            BlockingQueue<FileTask> queue,
+            FilesStat filesStat,
+            FileIndex fileIndex
+    ) {
         this.queue = queue;
-        this.indexMap = indexMap;
         this.filesStat = filesStat;
+        this.fileIndex = fileIndex;
     }
 
     @Override
@@ -29,7 +31,6 @@ public class FileWorker implements Runnable {
 
         while (true) {
             try {
-
                 FileTask fileTask = queue.take();
 
                 if (fileTask.path()
@@ -41,38 +42,47 @@ public class FileWorker implements Runnable {
                 }
 
                 if (fileTask.changeType() == ChangeType.DELETED) {
-                    FileInfo removed = indexMap.remove(fileTask.path());
+
+                    FileInfo removed =
+                            fileIndex.deleteInMap(fileTask.path());
 
                     if (removed != null) {
-                        filesStat.getCountByteFiles().add(-removed.fileSize());
                         filesStat.getCountFiles().decrementAndGet();
+                        filesStat.getCountByteFiles()
+                                .add(-removed.fileSize());
                     }
 
                     continue;
                 }
-                if (fileTask.changeType() == ChangeType.MODIFIED) {
-                    FileInfo oldFile = indexMap.get(fileTask.path());
-                    FileInfo newFile = FileProcessor.process(fileTask);
 
-                    if (oldFile != null) {
-                        long difference = newFile.fileSize() - oldFile.fileSize();
-                        filesStat.getCountByteFiles().add(difference);
+                if (fileTask.changeType() == ChangeType.CREATED
+                        || fileTask.changeType() == ChangeType.MODIFIED) {
+
+                    FileInfo newFile =
+                            FileProcessor.process(fileTask);
+
+                    FileInfo oldFile =
+                            fileIndex.addToMap(newFile);
+
+                    if (oldFile == null) {
+
+                        filesStat.getCountFiles()
+                                .incrementAndGet();
+
+                        filesStat.getCountByteFiles()
+                                .add(newFile.fileSize());
+
+                    } else {
+
+                        long difference =
+                                newFile.fileSize()
+                                        - oldFile.fileSize();
+
+                        filesStat.getCountByteFiles()
+                                .add(difference);
                     }
-
-                    indexMap.put(newFile.path(), newFile);
-
-                    continue;
                 }
-                if (fileTask.changeType() == ChangeType.CREATED) {
-                    FileInfo fileInfo = FileProcessor.process(fileTask);
 
-                    FileInfo old = indexMap.put(fileInfo.path(), fileInfo);
-
-                    if (old == null) {
-                        filesStat.getCountFiles().incrementAndGet();
-                        filesStat.getCountByteFiles().add(fileInfo.fileSize());
-                    }
-                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;

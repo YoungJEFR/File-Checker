@@ -1,0 +1,52 @@
+package org.example.watcher;
+
+import org.example.model.FileTask;
+
+import java.nio.file.Path;
+import java.util.Map;
+import java.util.concurrent.*;
+
+public class FileChangeDebounce {
+    private final ScheduledExecutorService scheduled;
+    private final Map<Path, ScheduledFuture<?>> tasks = new ConcurrentHashMap<>();
+    private final BlockingQueue<FileTask> queue;
+
+    public FileChangeDebounce(
+            ScheduledExecutorService scheduled,
+            BlockingQueue<FileTask> queue
+    ) {
+        this.scheduled = scheduled;
+        this.queue = queue;
+    }
+
+    public void debounceOnModify(FileTask fileTask) {
+        ScheduledFuture<?> oldFile = tasks.get(fileTask.path());
+        if (oldFile != null) {
+            oldFile.cancel(false);
+        }
+
+        ScheduledFuture<?> newTask = scheduled.schedule(() -> {
+
+            try {
+                queue.put(fileTask);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            tasks.remove(fileTask.path());
+        },
+        500,
+                TimeUnit.MILLISECONDS
+        );
+
+        tasks.put(fileTask.path(), newTask);
+    }
+
+    public void debounceCancel(Path path) {
+        ScheduledFuture<?> future = tasks.remove(path);
+
+        if (future != null) {
+            future.cancel(false);
+        }
+    }
+}

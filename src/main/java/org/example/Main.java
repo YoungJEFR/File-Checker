@@ -5,24 +5,23 @@ import org.example.model.FileTask;
 import org.example.model.FilesStat;
 import org.example.pipeline.FileProducer;
 import org.example.pipeline.FileWorker;
+import org.example.processor.FileIndex;
+import org.example.watcher.FileChangeDebounce;
+import org.example.watcher.FileWatcher;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Scanner;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
 public class Main {
 
-    public static void main(String[] args) {
-
+     static void main(String[] args) {
         Scanner scanner = new Scanner(System.in);
 
         System.out.println("Введите путь к папке:");
-
         Path root = Path.of(scanner.nextLine());
 
         if (!Files.exists(root) || !Files.isDirectory(root)) {
@@ -30,16 +29,46 @@ public class Main {
             return;
         }
 
-        AtomicInteger countFile = new AtomicInteger(0);
+        ScheduledExecutorService scheduledExecutorService = Executors.newSingleThreadScheduledExecutor();
+        AtomicInteger countFiles = new AtomicInteger(0);
         AtomicInteger errorFiles = new AtomicInteger(0);
         LongAdder countByteFiles = new LongAdder();
-        FilesStat filesStat = new FilesStat(countFile, errorFiles, countByteFiles);
-        ConcurrentHashMap<Path, FileInfo> indexMap = new ConcurrentHashMap<>();
+
+        FilesStat filesStat =
+                new FilesStat(countFiles, errorFiles, countByteFiles);
+
+        ConcurrentHashMap<Path, FileInfo> indexMap =
+                new ConcurrentHashMap<>();
 
         int workerCount = 3;
 
         BlockingQueue<FileTask> queue =
-                new ArrayBlockingQueue<>(3);
+                new ArrayBlockingQueue<>(100);
+
+        // =========================
+        // WORKERS
+        // =========================
+
+        Thread[] workers = new Thread[workerCount];
+
+        FileIndex fileIndex = new  FileIndex(indexMap);
+         FileChangeDebounce debounce =
+                 new FileChangeDebounce(scheduledExecutorService, queue);
+
+        for (int i = 0; i < workerCount; i++) {
+
+            FileWorker worker =
+                    new FileWorker(queue, filesStat, fileIndex);
+
+            workers[i] =
+                    new Thread(worker, "Worker-" + (i + 1));
+
+            workers[i].start();
+        }
+
+        // =========================
+        // INITIAL SCAN
+        // =========================
 
         FileProducer producer =
                 new FileProducer(root, queue);
@@ -47,32 +76,82 @@ public class Main {
         Thread producerThread =
                 new Thread(producer, "Producer");
 
-
-        Thread[] workers = new Thread[workerCount];
-
-        for (int i = 0; i < workerCount; i++) {
-
-            FileWorker worker =
-                    new FileWorker(queue, indexMap, filesStat);
-
-            workers[i] = new Thread(
-                    worker,
-                    "Worker-" + (i + 1)
-            );
-
-            workers[i].start();
-        }
-
-
         producerThread.start();
 
-
         try {
+            // Ждём завершения первоначального сканирования
             producerThread.join();
 
+            /*
+             * ВАЖНО:
+             * здесь STOP пока НЕ отправляем.
+             *
+             * Workers должны продолжать работать,
+             * потому что FileWatcher будет отправлять
+             * им новые FileTask.
+             */
+
+            System.out.println();
+            System.out.println("Первоначальное сканирование закончено.");
+
+            printState(indexMap, filesStat);
+
+            // =========================
+            // WATCH SERVICE
+            // =========================
+
+            FileWatcher fileWatcher =
+                    new FileWatcher(root, queue, debounce);
+
+            Thread watcherThread =
+                    new Thread(fileWatcher, "FileWatcher");
+
+            watcherThread.start();
+
+            System.out.println();
+            System.out.println("Наблюдение за папкой запущено.");
+            System.out.println();
+            System.out.println("Теперь попробуй:");
+            System.out.println("1. Создать .md файл");
+            System.out.println("2. Изменить .md файл");
+            System.out.println("3. Удалить .md файл");
+            System.out.println();
+            System.out.println("Нажми ENTER для завершения программы.");
+
+            // Main блокируется здесь,
+            // но Watcher и Workers продолжают работать
+            scanner.nextLine();
+
+            // =========================
+            // SHUTDOWN WATCHER
+            // =========================
+
+            System.out.println();
+            System.out.println("Останавливаем FileWatcher...");
+
+            watcherThread.interrupt();
+            watcherThread.join();
+            // =========================
+
+            scheduledExecutorService.shutdown();
+            scheduledExecutorService.awaitTermination(1, TimeUnit.MINUTES);
+            // =========================
+            // SHUTDOWN WORKERS
+            // =========================
+
+            /*
+             * Один STOP на каждого Worker.
+             *
+             * null допустим временно,
+             * потому что Worker проверяет path == STOP
+             * раньше, чем обращается к changeType().
+             */
             for (int i = 0; i < workerCount; i++) {
                 queue.put(
-                        new FileTask(Path.of("STOP"))
+                        new FileTask(
+                                Path.of("STOP"),
+                                null
+                        )
                 );
             }
 
@@ -80,21 +159,58 @@ public class Main {
                 worker.join();
             }
 
+            // =========================
+            // FINAL RESULT
+            // =========================
+
+            System.out.println();
+            System.out.println("Итоговое состояние:");
+
+            printState(indexMap, filesStat);
+
+            System.out.println();
+            System.out.println("Программа завершена.");
+
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return;
+        } finally {
+            scanner.close();
         }
+    }
 
-        System.out.println("Успешно обработанных файлов: " + filesStat.getCountFiles() + "\n" +
-                " | Ошибок: " +  filesStat.getErrorFiles() + "\n" +
-                " | Всего количество байт: " +  filesStat.getCountByteFiles());
+    private static void printState(
+            ConcurrentHashMap<Path, FileInfo> indexMap,
+            FilesStat filesStat
+    ) {
 
-        indexMap.forEach((path, fileInfo) -> {
-            System.out.println(path + " : " + fileInfo);
-        });
+        System.out.println();
+        System.out.println("===== СТАТИСТИКА =====");
 
-        System.out.println("Все файлы обработаны.");
+        System.out.println(
+                "Количество файлов: "
+                        + filesStat.getCountFiles()
+        );
 
-        scanner.close();
+        System.out.println(
+                "Количество байт: "
+                        + filesStat.getCountByteFiles()
+        );
+
+        System.out.println(
+                "Количество ошибок: "
+                        + filesStat.getErrorFiles()
+        );
+
+        System.out.println();
+        System.out.println("===== ИНДЕКС =====");
+
+        indexMap.forEach((path, fileInfo) ->
+                System.out.println(
+                        path + " -> " + fileInfo
+                )
+        );
+
+        System.out.println("=====================");
     }
 }

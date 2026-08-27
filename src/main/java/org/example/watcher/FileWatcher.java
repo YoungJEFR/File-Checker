@@ -10,10 +10,12 @@ import java.util.concurrent.BlockingQueue;
 public class FileWatcher implements Runnable {
     private final Path path;
     private final BlockingQueue<FileTask> fileTasks;
+    private final FileChangeDebounce debounce;
 
-    public FileWatcher(Path path, BlockingQueue<FileTask> fileTasks) {
+    public FileWatcher(Path path, BlockingQueue<FileTask> fileTasks, FileChangeDebounce debounce) {
         this.path = path;
         this.fileTasks = fileTasks;
+        this.debounce = debounce;
     }
 
     public void watch() throws IOException, InterruptedException {
@@ -39,6 +41,11 @@ public class FileWatcher implements Runnable {
                     Path fullPath = path.resolve(changedPath);
 
                     if (fullPath.toString().endsWith(".md")) {
+                        if (kind == StandardWatchEventKinds.ENTRY_MODIFY ) {
+                            debounce.debounceOnModify(new FileTask(fullPath, ChangeType.MODIFIED));
+                            continue;
+                        }
+
                         System.out.println(
                                 String.format("File changed: %s", changedPath.toString())
                         );
@@ -48,8 +55,7 @@ public class FileWatcher implements Runnable {
                             changeType = ChangeType.CREATED;
                         } else if (kind == StandardWatchEventKinds.ENTRY_DELETE) {
                             changeType = ChangeType.DELETED;
-                        } else if (kind == StandardWatchEventKinds.ENTRY_MODIFY) {
-                            changeType = ChangeType.MODIFIED;
+                            debounce.debounceCancel(fullPath);
                         } else {
                             continue;
                         }
