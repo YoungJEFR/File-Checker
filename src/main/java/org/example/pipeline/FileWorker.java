@@ -1,5 +1,6 @@
 package org.example.pipeline;
 
+import org.example.manager.PathLockManager;
 import org.example.model.ChangeType;
 import org.example.model.FileInfo;
 import org.example.model.FileTask;
@@ -9,21 +10,26 @@ import org.example.processor.FileProcessor;
 
 import java.io.IOException;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class FileWorker implements Runnable {
 
     private final BlockingQueue<FileTask> queue;
     private final FilesStat filesStat;
     private final FileIndex fileIndex;
+    private final PathLockManager lockManager;
+
 
     public FileWorker(
             BlockingQueue<FileTask> queue,
             FilesStat filesStat,
-            FileIndex fileIndex
+            FileIndex fileIndex,
+            PathLockManager lockManager
     ) {
         this.queue = queue;
         this.filesStat = filesStat;
         this.fileIndex = fileIndex;
+        this.lockManager = lockManager;
     }
 
     @Override
@@ -41,56 +47,65 @@ public class FileWorker implements Runnable {
                     return;
                 }
 
-                if (fileTask.changeType() == ChangeType.DELETED) {
+                ReentrantLock lock = lockManager.getLock(fileTask.path());
+                lock.lock();
 
-                    FileInfo removed =
-                            fileIndex.deleteInMap(fileTask.path());
+                try {
+                    if (fileTask.changeType() == ChangeType.DELETED) {
 
-                    if (removed != null) {
-                        filesStat.getCountFiles().decrementAndGet();
-                        filesStat.getCountByteFiles()
-                                .add(-removed.fileSize());
+                        FileInfo removed =
+                                fileIndex.deleteInMap(fileTask.path());
+
+                        if (removed != null) {
+                            filesStat.getCountFiles().decrementAndGet();
+                            filesStat.getCountByteFiles()
+                                    .add(-removed.fileSize());
+                        }
+
+                        continue;
                     }
 
-                    continue;
-                }
+                    if (fileTask.changeType() == ChangeType.CREATED
+                            || fileTask.changeType() == ChangeType.MODIFIED) {
 
-                if (fileTask.changeType() == ChangeType.CREATED
-                        || fileTask.changeType() == ChangeType.MODIFIED) {
+                        FileInfo newFile =
+                                FileProcessor.process(fileTask);
 
-                    FileInfo newFile =
-                            FileProcessor.process(fileTask);
+                        FileInfo oldFile =
+                                fileIndex.addToMap(newFile);
 
-                    FileInfo oldFile =
-                            fileIndex.addToMap(newFile);
+                        if (oldFile == null) {
 
-                    if (oldFile == null) {
+                            filesStat.getCountFiles()
+                                    .incrementAndGet();
 
-                        filesStat.getCountFiles()
-                                .incrementAndGet();
+                            filesStat.getCountByteFiles()
+                                    .add(newFile.fileSize());
 
-                        filesStat.getCountByteFiles()
-                                .add(newFile.fileSize());
+                        } else {
 
-                    } else {
+                            long difference =
+                                    newFile.fileSize()
+                                            - oldFile.fileSize();
 
-                        long difference =
-                                newFile.fileSize()
-                                        - oldFile.fileSize();
-
-                        filesStat.getCountByteFiles()
-                                .add(difference);
+                            filesStat.getCountByteFiles()
+                                    .add(difference);
+                        }
                     }
+                } finally {
+                    lock.unlock();
                 }
 
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
 
-            } catch (IOException e) {
-                e.printStackTrace();
-                filesStat.getErrorFiles().incrementAndGet();
-            }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                    filesStat.getErrorFiles().incrementAndGet();
+                }
+
+
         }
     }
 }

@@ -1,5 +1,6 @@
 package org.example;
 
+import org.example.manager.PathLockManager;
 import org.example.model.FileInfo;
 import org.example.model.FileTask;
 import org.example.model.FilesStat;
@@ -20,6 +21,8 @@ public class Main {
 
      static void main(String[] args) {
         Scanner scanner = new Scanner(System.in);
+        PathLockManager pathLockManager = new PathLockManager();
+
 
         System.out.println("Введите путь к папке:");
         Path root = Path.of(scanner.nextLine());
@@ -58,7 +61,7 @@ public class Main {
         for (int i = 0; i < workerCount; i++) {
 
             FileWorker worker =
-                    new FileWorker(queue, filesStat, fileIndex);
+                    new FileWorker(queue, filesStat, fileIndex, pathLockManager);
 
             workers[i] =
                     new Thread(worker, "Worker-" + (i + 1));
