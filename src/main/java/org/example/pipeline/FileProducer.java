@@ -1,20 +1,20 @@
 package org.example.pipeline;
 
 import org.example.model.FileTask;
+import org.example.route.TaskRouter;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.concurrent.BlockingQueue;
 import java.util.stream.Stream;
 
 public class FileProducer implements Runnable{
     private final Path path;
-    private BlockingQueue<FileTask> queue;
+    private final TaskRouter taskRouter;
 
-    public FileProducer(Path path, BlockingQueue<FileTask> queue) {
+    public FileProducer(Path path, TaskRouter taskRouter) {
         this.path = path;
-        this.queue = queue;
+        this.taskRouter = taskRouter;
     }
 
     @Override
@@ -35,7 +35,7 @@ public class FileProducer implements Runnable{
                 }
 
                 try{
-                    queue.put(new FileTask(file));
+                    taskRouter.route(new FileTask(file));
                 } catch (InterruptedException e){
                     Thread.currentThread().interrupt();
                     return;

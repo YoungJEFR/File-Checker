@@ -1,6 +1,5 @@
 package org.example.pipeline;
 
-import org.example.manager.PathLockManager;
 import org.example.model.ChangeType;
 import org.example.model.FileInfo;
 import org.example.model.FileTask;
@@ -10,26 +9,21 @@ import org.example.processor.FileProcessor;
 
 import java.io.IOException;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.locks.ReentrantLock;
 
 public class FileWorker implements Runnable {
 
     private final BlockingQueue<FileTask> queue;
     private final FilesStat filesStat;
     private final FileIndex fileIndex;
-    private final PathLockManager lockManager;
-
 
     public FileWorker(
             BlockingQueue<FileTask> queue,
             FilesStat filesStat,
-            FileIndex fileIndex,
-            PathLockManager lockManager
+            FileIndex fileIndex
     ) {
         this.queue = queue;
         this.filesStat = filesStat;
         this.fileIndex = fileIndex;
-        this.lockManager = lockManager;
     }
 
     @Override
@@ -46,12 +40,7 @@ public class FileWorker implements Runnable {
 
                     return;
                 }
-
-                ReentrantLock lock = lockManager.getLock(fileTask.path());
-                lock.lock();
-
-                try {
-                    if (fileTask.changeType() == ChangeType.DELETED) {
+                if (fileTask.changeType() == ChangeType.DELETED) {
 
                         FileInfo removed =
                                 fileIndex.deleteInMap(fileTask.path());
@@ -92,9 +81,7 @@ public class FileWorker implements Runnable {
                                     .add(difference);
                         }
                     }
-                } finally {
-                    lock.unlock();
-                }
+
 
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();

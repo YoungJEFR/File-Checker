@@ -1,6 +1,7 @@
 package org.example.watcher;
 
 import org.example.model.FileTask;
+import org.example.route.TaskRouter;
 
 import java.nio.file.Path;
 import java.util.Map;
@@ -9,14 +10,13 @@ import java.util.concurrent.*;
 public class FileChangeDebounce {
     private final ScheduledExecutorService scheduled;
     private final Map<Path, ScheduledFuture<?>> tasks = new ConcurrentHashMap<>();
-    private final BlockingQueue<FileTask> queue;
-
+    private final TaskRouter taskRouter;
     public FileChangeDebounce(
             ScheduledExecutorService scheduled,
-            BlockingQueue<FileTask> queue
+            TaskRouter taskRouter
     ) {
         this.scheduled = scheduled;
-        this.queue = queue;
+        this.taskRouter = taskRouter;
     }
 
     public void debounceOnModify(FileTask fileTask) {
@@ -28,7 +28,7 @@ public class FileChangeDebounce {
         ScheduledFuture<?> newTask = scheduled.schedule(() -> {
 
             try {
-                queue.put(fileTask);
+                taskRouter.route(fileTask);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;

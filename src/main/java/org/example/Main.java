@@ -1,17 +1,19 @@
 package org.example;
 
-import org.example.manager.PathLockManager;
 import org.example.model.FileInfo;
 import org.example.model.FileTask;
 import org.example.model.FilesStat;
 import org.example.pipeline.FileProducer;
 import org.example.pipeline.FileWorker;
 import org.example.processor.FileIndex;
+import org.example.route.TaskRouter;
 import org.example.watcher.FileChangeDebounce;
 import org.example.watcher.FileWatcher;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Scanner;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -21,8 +23,7 @@ public class Main {
 
      static void main(String[] args) {
         Scanner scanner = new Scanner(System.in);
-        PathLockManager pathLockManager = new PathLockManager();
-
+         List<BlockingQueue<FileTask>> queues = new ArrayList<>();
 
         System.out.println("Введите путь к папке:");
         Path root = Path.of(scanner.nextLine());
@@ -45,8 +46,9 @@ public class Main {
 
         int workerCount = 3;
 
-        BlockingQueue<FileTask> queue =
-                new ArrayBlockingQueue<>(100);
+        for (int i = 0; i < workerCount; i++) {
+            queues.add(new ArrayBlockingQueue<>(100));
+        }
 
         // =========================
         // WORKERS
@@ -55,13 +57,16 @@ public class Main {
         Thread[] workers = new Thread[workerCount];
 
         FileIndex fileIndex = new  FileIndex(indexMap);
-         FileChangeDebounce debounce =
-                 new FileChangeDebounce(scheduledExecutorService, queue);
+
 
         for (int i = 0; i < workerCount; i++) {
 
             FileWorker worker =
-                    new FileWorker(queue, filesStat, fileIndex, pathLockManager);
+                    new FileWorker(
+                            queues.get(i),
+                            filesStat,
+                            fileIndex
+                    );
 
             workers[i] =
                     new Thread(worker, "Worker-" + (i + 1));
@@ -69,12 +74,15 @@ public class Main {
             workers[i].start();
         }
 
+        TaskRouter taskRouter = new TaskRouter(queues);
+         FileChangeDebounce debounce =
+                 new FileChangeDebounce(scheduledExecutorService, taskRouter);
         // =========================
         // INITIAL SCAN
         // =========================
 
         FileProducer producer =
-                new FileProducer(root, queue);
+                new FileProducer(root, taskRouter);
 
         Thread producerThread =
                 new Thread(producer, "Producer");
@@ -104,7 +112,7 @@ public class Main {
             // =========================
 
             FileWatcher fileWatcher =
-                    new FileWatcher(root, queue, debounce);
+                    new FileWatcher(root, debounce, taskRouter);
 
             Thread watcherThread =
                     new Thread(fileWatcher, "FileWatcher");
@@ -150,12 +158,12 @@ public class Main {
              * раньше, чем обращается к changeType().
              */
             for (int i = 0; i < workerCount; i++) {
-                queue.put(
+                BlockingQueue<FileTask> filesQueue = queues.get(i);
+                filesQueue.put(
                         new FileTask(
-                                Path.of("STOP"),
-                                null
-                        )
-                );
+                        Path.of("STOP"),
+                        null
+                ));
             }
 
             for (Thread worker : workers) {

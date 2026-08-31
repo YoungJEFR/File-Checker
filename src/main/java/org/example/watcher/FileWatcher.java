@@ -2,6 +2,7 @@ package org.example.watcher;
 
 import org.example.model.ChangeType;
 import org.example.model.FileTask;
+import org.example.route.TaskRouter;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -9,13 +10,17 @@ import java.util.concurrent.BlockingQueue;
 
 public class FileWatcher implements Runnable {
     private final Path path;
-    private final BlockingQueue<FileTask> fileTasks;
     private final FileChangeDebounce debounce;
+    private final TaskRouter taskRouter;
 
-    public FileWatcher(Path path, BlockingQueue<FileTask> fileTasks, FileChangeDebounce debounce) {
+    public FileWatcher(
+            Path path,
+            FileChangeDebounce debounce,
+            TaskRouter taskRouter
+    ) {
         this.path = path;
-        this.fileTasks = fileTasks;
         this.debounce = debounce;
+        this.taskRouter = taskRouter;
     }
 
     public void watch() throws IOException, InterruptedException {
@@ -60,7 +65,7 @@ public class FileWatcher implements Runnable {
                             continue;
                         }
 
-                        fileTasks.put(new FileTask(fullPath, changeType));
+                        taskRouter.route(new FileTask(fullPath, changeType));
                     }
                 }
 
