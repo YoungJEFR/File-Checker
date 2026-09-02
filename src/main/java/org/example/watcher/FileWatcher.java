@@ -62,7 +62,7 @@ public class FileWatcher implements Runnable {
 
                     if (kind ==  StandardWatchEventKinds.ENTRY_CREATE
                     && Files.isDirectory(fullPath)) {
-                        watchRegistrar.registerRecursively(path, watcher);
+                        watchRegistrar.registerRecursively(fullPath, watcher);
                         requestRescan(fullPath);
                         continue;
                     }
