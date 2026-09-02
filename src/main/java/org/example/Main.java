@@ -1,5 +1,6 @@
 package org.example;
 
+import org.example.filescanner.FileScanner;
 import org.example.model.FileInfo;
 import org.example.model.FileTask;
 import org.example.model.FilesStat;
@@ -9,160 +10,170 @@ import org.example.processor.FileIndex;
 import org.example.route.TaskRouter;
 import org.example.watcher.FileChangeDebounce;
 import org.example.watcher.FileWatcher;
+import org.example.watcher.WatchRegistrar;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.WatchKey;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Scanner;
-import java.util.concurrent.*;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
 public class Main {
 
-     static void main(String[] args) {
-        Scanner scanner = new Scanner(System.in);
-         List<BlockingQueue<FileTask>> queues = new ArrayList<>();
+    private static final int WORKER_COUNT = 3;
+    private static final int QUEUE_CAPACITY = 100;
 
-        System.out.println("Введите путь к папке:");
-        Path root = Path.of(scanner.nextLine());
+    public static void main(String[] args) {
+        try (Scanner console = new Scanner(System.in)) {
+            System.out.println("Введите путь к папке:");
 
-        if (!Files.exists(root) || !Files.isDirectory(root)) {
-            System.out.println("Папка не найдена");
-            return;
+            Path root = Path.of(console.nextLine())
+                    .toAbsolutePath()
+                    .normalize();
+
+            if (!Files.isDirectory(root)) {
+                System.out.println("Папка не найдена");
+                return;
+            }
+
+            runIndexer(root, console);
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("Работа программы была прервана");
         }
+    }
 
-        ScheduledExecutorService scheduledExecutorService = Executors.newSingleThreadScheduledExecutor();
-        AtomicInteger countFiles = new AtomicInteger(0);
-        AtomicInteger errorFiles = new AtomicInteger(0);
-        LongAdder countByteFiles = new LongAdder();
+    private static void runIndexer(
+            Path root,
+            Scanner console
+    ) throws InterruptedException {
 
-        FilesStat filesStat =
-                new FilesStat(countFiles, errorFiles, countByteFiles);
+        List<BlockingQueue<FileTask>> queues =
+                createQueues(WORKER_COUNT);
+
+        FilesStat filesStat = new FilesStat(
+                new AtomicInteger(),
+                new AtomicInteger(),
+                new LongAdder()
+        );
 
         ConcurrentHashMap<Path, FileInfo> indexMap =
                 new ConcurrentHashMap<>();
 
-        int workerCount = 3;
-
-        for (int i = 0; i < workerCount; i++) {
-            queues.add(new ArrayBlockingQueue<>(100));
-        }
-
-        // =========================
-        // WORKERS
-        // =========================
-
-        Thread[] workers = new Thread[workerCount];
-
-        FileIndex fileIndex = new  FileIndex(indexMap);
-
-
-        for (int i = 0; i < workerCount; i++) {
-
-            FileWorker worker =
-                    new FileWorker(
-                            queues.get(i),
-                            filesStat,
-                            fileIndex
-                    );
-
-            workers[i] =
-                    new Thread(worker, "Worker-" + (i + 1));
-
-            workers[i].start();
-        }
-
+        FileIndex fileIndex = new FileIndex(indexMap);
         TaskRouter taskRouter = new TaskRouter(queues);
-         FileChangeDebounce debounce =
-                 new FileChangeDebounce(scheduledExecutorService, taskRouter);
-        // =========================
-        // INITIAL SCAN
-        // =========================
+        FileScanner fileScanner = new FileScanner();
 
-        FileProducer producer =
-                new FileProducer(root, taskRouter);
+        ScheduledExecutorService debounceExecutor =
+                Executors.newSingleThreadScheduledExecutor(runnable ->
+                        new Thread(runnable, "DebounceWorker")
+                );
 
-        Thread producerThread =
-                new Thread(producer, "Producer");
+        ExecutorService rescanExecutor =
+                Executors.newSingleThreadExecutor(runnable ->
+                        new Thread(runnable, "RescanWorker")
+                );
 
-        producerThread.start();
+        FileChangeDebounce debounce =
+                new FileChangeDebounce(
+                        debounceExecutor,
+                        taskRouter
+                );
+
+        Map<WatchKey, Path> registeredDirectories =
+                new ConcurrentHashMap<>();
+
+        WatchRegistrar watchRegistrar =
+                new WatchRegistrar(
+                        new ConcurrentHashMap<>(
+                                registeredDirectories
+                        )
+                );
+
+        Thread[] workers = startWorkers(
+                queues,
+                filesStat,
+                fileIndex
+        );
+
+        FileWatcher fileWatcher = new FileWatcher(
+                root,
+                debounce,
+                taskRouter,
+                watchRegistrar,
+                rescanExecutor,
+                fileScanner
+        );
+
+        Thread watcherThread =
+                new Thread(fileWatcher, "FileWatcher");
 
         try {
-            producerThread.join();
+            runInitialScan(
+                    root,
+                    taskRouter,
+                    fileScanner
+            );
 
             System.out.println();
-            System.out.println("Первоначальное сканирование закончено.");
+            System.out.println(
+                    "Первоначальный обход директории закончен."
+            );
 
+            /*
+             * На этом этапе producer закончил добавлять задачи,
+             * но workers теоретически ещё могут их обрабатывать.
+             *
+             * Позже здесь следует добавить Barrier +
+             * CountDownLatch.
+             */
             printState(indexMap, filesStat);
-
-            // =========================
-            // WATCH SERVICE
-            // =========================
-
-            FileWatcher fileWatcher =
-                    new FileWatcher(root, debounce, taskRouter);
-
-            Thread watcherThread =
-                    new Thread(fileWatcher, "FileWatcher");
 
             watcherThread.start();
 
             System.out.println();
             System.out.println("Наблюдение за папкой запущено.");
             System.out.println();
-            System.out.println("Теперь попробуй:");
+            System.out.println("Теперь попробуйте:");
             System.out.println("1. Создать .md файл");
             System.out.println("2. Изменить .md файл");
             System.out.println("3. Удалить .md файл");
             System.out.println();
-            System.out.println("Нажми ENTER для завершения программы.");
+            System.out.println(
+                    "Нажмите ENTER для завершения программы."
+            );
 
-            // Main блокируется здесь,
-            // но Watcher и Workers продолжают работать
-            scanner.nextLine();
+            console.nextLine();
 
-            // =========================
-            // SHUTDOWN WATCHER
-            // =========================
-
+        } finally {
             System.out.println();
             System.out.println("Останавливаем FileWatcher...");
 
-            watcherThread.interrupt();
-            watcherThread.join();
-            // =========================
+            stopWatcher(watcherThread);
 
-            scheduledExecutorService.shutdown();
-            scheduledExecutorService.awaitTermination(1, TimeUnit.MINUTES);
-            // =========================
-            // SHUTDOWN WORKERS
-            // =========================
+            shutdownExecutor(
+                    rescanExecutor,
+                    "Rescan executor"
+            );
 
-            /*
-             * Один STOP на каждого Worker.
-             *
-             * null допустим временно,
-             * потому что Worker проверяет path == STOP
-             * раньше, чем обращается к changeType().
-             */
-            for (int i = 0; i < workerCount; i++) {
-                BlockingQueue<FileTask> filesQueue = queues.get(i);
-                filesQueue.put(
-                        new FileTask(
-                        Path.of("STOP"),
-                        null
-                ));
-            }
+            shutdownExecutor(
+                    debounceExecutor,
+                    "Debounce executor"
+            );
 
-            for (Thread worker : workers) {
-                worker.join();
-            }
-
-            // =========================
-            // FINAL RESULT
-            // =========================
+            stopWorkers(queues, workers);
 
             System.out.println();
             System.out.println("Итоговое состояние:");
@@ -171,12 +182,125 @@ public class Main {
 
             System.out.println();
             System.out.println("Программа завершена.");
+        }
+    }
 
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+    private static List<BlockingQueue<FileTask>> createQueues(
+            int workerCount
+    ) {
+        List<BlockingQueue<FileTask>> queues =
+                new ArrayList<>(workerCount);
+
+        for (int i = 0; i < workerCount; i++) {
+            queues.add(
+                    new ArrayBlockingQueue<>(QUEUE_CAPACITY)
+            );
+        }
+
+        return queues;
+    }
+
+    private static Thread[] startWorkers(
+            List<BlockingQueue<FileTask>> queues,
+            FilesStat filesStat,
+            FileIndex fileIndex
+    ) {
+        Thread[] workers = new Thread[queues.size()];
+
+        for (int i = 0; i < queues.size(); i++) {
+            FileWorker worker = new FileWorker(
+                    queues.get(i),
+                    filesStat,
+                    fileIndex
+            );
+
+            workers[i] = new Thread(
+                    worker,
+                    "Worker-" + (i + 1)
+            );
+
+            workers[i].start();
+        }
+
+        return workers;
+    }
+
+    private static void runInitialScan(
+            Path root,
+            TaskRouter taskRouter,
+            FileScanner fileScanner
+    ) throws InterruptedException {
+
+        FileProducer producer = new FileProducer(
+                root,
+                taskRouter,
+                fileScanner
+        );
+
+        Thread producerThread =
+                new Thread(producer, "Producer");
+
+        producerThread.start();
+        producerThread.join();
+    }
+
+    private static void stopWatcher(
+            Thread watcherThread
+    ) throws InterruptedException {
+
+        if (!watcherThread.isAlive()) {
             return;
-        } finally {
-            scanner.close();
+        }
+
+        watcherThread.interrupt();
+        watcherThread.join();
+    }
+
+    private static void shutdownExecutor(
+            ExecutorService executor,
+            String executorName
+    ) throws InterruptedException {
+
+        executor.shutdown();
+
+        if (executor.awaitTermination(30, TimeUnit.SECONDS)) {
+            return;
+        }
+
+        System.err.println(
+                executorName
+                        + " не завершился вовремя. Выполняется shutdownNow()."
+        );
+
+        executor.shutdownNow();
+
+        if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+            System.err.println(
+                    executorName + " не удалось завершить"
+            );
+        }
+    }
+
+    private static void stopWorkers(
+            List<BlockingQueue<FileTask>> queues,
+            Thread[] workers
+    ) throws InterruptedException {
+
+        for (BlockingQueue<FileTask> queue : queues) {
+            /*
+             * Временный вариант.
+             * Позже заменить на отдельную Stop-задачу.
+             */
+            queue.put(
+                    new FileTask(
+                            Path.of("STOP"),
+                            null
+                    )
+            );
+        }
+
+        for (Thread worker : workers) {
+            worker.join();
         }
     }
 
@@ -184,7 +308,6 @@ public class Main {
             ConcurrentHashMap<Path, FileInfo> indexMap,
             FilesStat filesStat
     ) {
-
         System.out.println();
         System.out.println("===== СТАТИСТИКА =====");
 

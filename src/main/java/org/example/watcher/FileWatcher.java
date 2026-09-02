@@ -1,5 +1,6 @@
 package org.example.watcher;
 
+import org.example.filescanner.FileScanner;
 import org.example.model.ChangeType;
 import org.example.model.FileTask;
 import org.example.route.TaskRouter;
@@ -9,33 +10,45 @@ import java.nio.file.*;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.stream.Stream;
 
 public class FileWatcher implements Runnable {
     private final Path path;
     private final FileChangeDebounce debounce;
     private final TaskRouter taskRouter;
-
-    private final Map<WatchKey, Path> fileWatchers = new ConcurrentHashMap<>();
+    private final WatchRegistrar watchRegistrar;
+    private final ExecutorService executorService;
+    private final FileScanner scanner;
 
     public FileWatcher(
             Path path,
             FileChangeDebounce debounce,
-            TaskRouter taskRouter
+            TaskRouter taskRouter,
+            WatchRegistrar watchRegistrar,
+            ExecutorService executorService,
+            FileScanner scanner
     ) {
         this.path = path;
         this.debounce = debounce;
         this.taskRouter = taskRouter;
+        this.watchRegistrar = watchRegistrar;
+        this.executorService = executorService;
+        this.scanner = scanner;
     }
 
     public void watch() throws IOException, InterruptedException {
         try (WatchService watcher = FileSystems.getDefault().newWatchService()) {
-            registerAllDirectory(path, watcher);
+            watchRegistrar.registerRecursively(path, watcher);
 
             while (true) {
                 WatchKey key = watcher.take();
-                Path directory = fileWatchers.get(key);
+                Path directory = watchRegistrar.directoryFor(key);
 
+                if (directory == null) {
+                    key.reset();
+                    continue;
+                }
 
                 for (WatchEvent<?> event : key.pollEvents()) {
                     WatchEvent.Kind<?> kind = event.kind();
@@ -47,11 +60,11 @@ public class FileWatcher implements Runnable {
                     Path changedPath = (Path) event.context();
                     Path fullPath = directory.resolve(changedPath);
 
-                    if (kind ==  StandardWatchEventKinds.ENTRY_CREATE) {
-                        if(Files.isDirectory(fullPath)) {
-                           registerAllDirectory(fullPath, watcher);
-                            continue;
-                        }
+                    if (kind ==  StandardWatchEventKinds.ENTRY_CREATE
+                    && Files.isDirectory(fullPath)) {
+                        watchRegistrar.registerRecursively(path, watcher);
+                        requestRescan(fullPath);
+                        continue;
                     }
                     if (fullPath.toString().endsWith(".md")) {
                         if (kind == StandardWatchEventKinds.ENTRY_MODIFY ) {
@@ -78,9 +91,9 @@ public class FileWatcher implements Runnable {
                 }
 
                 if(!key.reset()){
-                    fileWatchers.remove(key);
+                    watchRegistrar.remove(key);
 
-                    if (fileWatchers.isEmpty()) {
+                    if (watchRegistrar.isEmpty()) {
                         break;
                     }
                 }
@@ -88,24 +101,23 @@ public class FileWatcher implements Runnable {
         }
     }
 
-    public void registerAllDirectory(Path path, WatchService watcher) throws IOException {
-        List<Path> files;
-        try (Stream<Path> getAllDirectory = Files.walk(path)) {
-            files = getAllDirectory
-                    .filter(Files::isDirectory)
-                    .toList();
+    private void requestRescan(Path path) {
+        executorService.submit(() -> {
+            try {
+                scanner.scanFile(
+                        path,
+                        path1 -> taskRouter.route(
+                                new FileTask(path1, ChangeType.MODIFIED)
+                        )
 
-            for (Path pathFile : files) {
-                WatchKey key = pathFile.register(
-                        watcher,
-                        StandardWatchEventKinds.ENTRY_CREATE,
-                        StandardWatchEventKinds.ENTRY_DELETE,
-                        StandardWatchEventKinds.ENTRY_MODIFY
                 );
-                fileWatchers.put(key, pathFile);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (IOException e){
+                e.printStackTrace();
             }
-
-        }
+        });
     }
 
     @Override
