@@ -90,17 +90,7 @@ public class Main {
         producerThread.start();
 
         try {
-            // Ждём завершения первоначального сканирования
             producerThread.join();
-
-            /*
-             * ВАЖНО:
-             * здесь STOP пока НЕ отправляем.
-             *
-             * Workers должны продолжать работать,
-             * потому что FileWatcher будет отправлять
-             * им новые FileTask.
-             */
 
             System.out.println();
             System.out.println("Первоначальное сканирование закончено.");
