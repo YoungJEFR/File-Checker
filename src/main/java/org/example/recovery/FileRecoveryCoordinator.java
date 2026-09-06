@@ -111,8 +111,8 @@ public class FileRecoveryCoordinator {
                 }
             }
             return false;
-        } else if(failedTask.taskSource() == TaskSource.RECONCILIATION) {
-            System.err.println("Recovery failed" + cause.getMessage());
+        } else if (failedTask.taskSource() == TaskSource.RECONCILIATION) {
+            System.err.println("Recovery failed: " + cause.getMessage() + ". Путь " + failedTask.path());
             cause.printStackTrace(System.err);
 
             return false;

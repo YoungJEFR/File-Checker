@@ -113,7 +113,7 @@ public class FileWatcher implements Runnable {
         requestRescan(directory);
     }
 
-    public IOException getIoException() {
+    public IOException getStartupFailure() {
         return startupFailure;
     }
 

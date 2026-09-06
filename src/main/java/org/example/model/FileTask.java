@@ -6,7 +6,7 @@ public record FileTask(
         Path path,
         ChangeType changeType,
         TaskSource taskSource
-) {
+) implements WorkerTask{
     public FileTask(Path path, ChangeType changeType) {
         this(path, changeType, TaskSource.NORMAL);
     }

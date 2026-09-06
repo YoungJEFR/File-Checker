@@ -2,8 +2,9 @@ package org.example;
 
 import org.example.filescanner.FileScanner;
 import org.example.model.FileInfo;
-import org.example.model.FileTask;
 import org.example.model.FilesStat;
+import org.example.model.StopTask;
+import org.example.model.WorkerTask;
 import org.example.pipeline.FileProducer;
 import org.example.pipeline.FileWorker;
 import org.example.processor.FileIndex;
@@ -67,7 +68,7 @@ public class Main {
             Scanner console
     ) throws InterruptedException {
 
-        List<BlockingQueue<FileTask>> queues =
+        List<BlockingQueue<WorkerTask>> queues =
                 createQueues(WORKER_COUNT);
 
         FilesStat filesStat = new FilesStat(
@@ -165,7 +166,7 @@ public class Main {
             watcherThread.start();
             watcherReady.await();
 
-            IOException startupFailure = fileWatcher.getIoException();
+            IOException startupFailure = fileWatcher.getStartupFailure();
             if (startupFailure != null) {
                 System.err.println(
                         "Не удалось запустить FileWatcher: "
@@ -238,10 +239,10 @@ public class Main {
         }
     }
 
-    private static List<BlockingQueue<FileTask>> createQueues(
+    private static List<BlockingQueue<WorkerTask>> createQueues(
             int workerCount
     ) {
-        List<BlockingQueue<FileTask>> queues =
+        List<BlockingQueue<WorkerTask>> queues =
                 new ArrayList<>(workerCount);
 
         for (int i = 0; i < workerCount; i++) {
@@ -254,7 +255,7 @@ public class Main {
     }
 
     private static Thread[] startWorkers(
-            List<BlockingQueue<FileTask>> queues,
+            List<BlockingQueue<WorkerTask>> queues,
             FilesStat filesStat,
             FileIndex fileIndex,
             FileRecoveryCoordinator recoveryCoordinator
@@ -350,21 +351,12 @@ public class Main {
     }
 
     private static void stopWorkers(
-            List<BlockingQueue<FileTask>> queues,
+            List<BlockingQueue<WorkerTask>> queues,
             Thread[] workers
     ) throws InterruptedException {
 
-        for (BlockingQueue<FileTask> queue : queues) {
-            /*
-             * Временный вариант.
-             * Позже заменить на отдельную Stop-задачу.
-             */
-            queue.put(
-                    new FileTask(
-                            Path.of("STOP"),
-                            null
-                    )
-            );
+        for (BlockingQueue<WorkerTask> queue : queues) {
+            queue.put(new StopTask());
         }
 
         for (Thread worker : workers) {

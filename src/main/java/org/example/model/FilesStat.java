@@ -3,12 +3,12 @@ package org.example.model;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
-public class FilesStat  {
+public class FilesStat {
     private final LongAdder countByteFiles;
     private final AtomicInteger countFiles;
     private final AtomicInteger errorFiles;
 
-    public FilesStat( AtomicInteger countFiles, AtomicInteger errorFiles, LongAdder countByteFiles) {
+    public FilesStat(AtomicInteger countFiles, AtomicInteger errorFiles, LongAdder countByteFiles) {
         this.countByteFiles = countByteFiles;
         this.countFiles = countFiles;
         this.errorFiles = errorFiles;

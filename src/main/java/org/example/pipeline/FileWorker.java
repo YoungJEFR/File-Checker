@@ -1,9 +1,6 @@
 package org.example.pipeline;
 
-import org.example.model.ChangeType;
-import org.example.model.FileInfo;
-import org.example.model.FileTask;
-import org.example.model.FilesStat;
+import org.example.model.*;
 import org.example.processor.FileIndex;
 import org.example.processor.FileProcessor;
 import org.example.recovery.FileRecoveryCoordinator;
@@ -13,13 +10,13 @@ import java.nio.file.NoSuchFileException;
 import java.util.concurrent.BlockingQueue;
 
 public class FileWorker implements Runnable {
-    private final BlockingQueue<FileTask> queue;
+    private final BlockingQueue<WorkerTask> queue;
     private final FilesStat filesStat;
     private final FileIndex fileIndex;
     private final FileRecoveryCoordinator fileRecoveryCoordinator;
 
 
-    public FileWorker(BlockingQueue<FileTask> queue, FilesStat filesStat, FileIndex fileIndex, FileRecoveryCoordinator fileRecoveryCoordinator) {
+    public FileWorker(BlockingQueue<WorkerTask> queue, FilesStat filesStat, FileIndex fileIndex, FileRecoveryCoordinator fileRecoveryCoordinator) {
         this.queue = queue;
         this.filesStat = filesStat;
         this.fileIndex = fileIndex;
@@ -29,17 +26,21 @@ public class FileWorker implements Runnable {
     @Override
     public void run() {
         while (true) {
-            FileTask fileTask;
+            WorkerTask workerTask;
 
             try {
-                fileTask = queue.take();
+                workerTask = queue.take();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
             }
 
-            if (fileTask.path().getFileName().toString().equals("STOP")) {
+            if (workerTask instanceof StopTask) {
                 return;
+            }
+
+            if (!(workerTask instanceof FileTask fileTask)) {
+                continue;
             }
 
             try {
@@ -61,7 +62,7 @@ public class FileWorker implements Runnable {
                 }
 
                 fileRecoveryCoordinator.onSuccess(fileTask.path());
-            } catch (NoSuchFileException e){
+            } catch (NoSuchFileException e) {
                 deleteIndexInMap(
                         fileIndex,
                         fileTask,

@@ -1,15 +1,16 @@
 package org.example.route;
 
 import org.example.model.FileTask;
+import org.example.model.WorkerTask;
 
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 
 public class TaskRouter {
-    private final List<BlockingQueue<FileTask>> queues;
+    private final List<BlockingQueue<WorkerTask>> queues;
 
-    public TaskRouter(List<BlockingQueue<FileTask>> queues) {
+    public TaskRouter(List<BlockingQueue<WorkerTask>> queues) {
         if (queues.isEmpty()) {
             throw new IllegalArgumentException("queues must not be empty");
         }
