@@ -5,7 +5,10 @@ import org.example.route.TaskRouter;
 
 import java.nio.file.Path;
 import java.util.Map;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 public class FileChangeDebounce {
     private final ScheduledExecutorService scheduled;
@@ -26,7 +29,6 @@ public class FileChangeDebounce {
         }
 
         ScheduledFuture<?> newTask = scheduled.schedule(() -> {
-
             try {
                 taskRouter.route(fileTask);
             } catch (InterruptedException e) {

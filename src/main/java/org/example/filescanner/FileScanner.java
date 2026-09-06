@@ -13,13 +13,13 @@ import java.util.stream.Stream;
 public class FileScanner {
 
     @FunctionalInterface
-    public interface FileHandler{
+    public interface FileHandler {
         void handle(Path path) throws InterruptedException;
     }
 
     public void scanFile(Path root, FileHandler handler)
-            throws InterruptedException, IOException{
-        try(Stream<Path> stream = Files.walk(root)) {
+            throws InterruptedException, IOException {
+        try (Stream<Path> stream = Files.walk(root)) {
             Iterator<Path> iterator = stream
                     .filter(Files::isRegularFile)
                     .filter(this::isMarkdown)
@@ -34,7 +34,7 @@ public class FileScanner {
         }
     }
 
-    private boolean isMarkdown(Path path){
+    private boolean isMarkdown(Path path) {
         return path
                 .getFileName()
                 .toString()

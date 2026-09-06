@@ -7,11 +7,16 @@ import org.example.model.FilesStat;
 import org.example.pipeline.FileProducer;
 import org.example.pipeline.FileWorker;
 import org.example.processor.FileIndex;
+import org.example.reconciliation.DirectoryReconciler;
+import org.example.reconciliation.DirectoryReconciliationService;
+import org.example.reconciliation.DirectoryRecoveryHandler;
+import org.example.recovery.FileRecoveryCoordinator;
 import org.example.route.TaskRouter;
 import org.example.watcher.FileChangeDebounce;
 import org.example.watcher.FileWatcher;
 import org.example.watcher.WatchRegistrar;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.WatchKey;
@@ -22,6 +27,7 @@ import java.util.Scanner;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -33,6 +39,7 @@ public class Main {
 
     private static final int WORKER_COUNT = 3;
     private static final int QUEUE_CAPACITY = 100;
+    private static final int MAX_RECOVERY_ATTEMPTS = 3;
 
     public static void main(String[] args) {
         try (Scanner console = new Scanner(System.in)) {
@@ -86,6 +93,11 @@ public class Main {
                         new Thread(runnable, "RescanWorker")
                 );
 
+        ScheduledExecutorService recoveryExecutor =
+                Executors.newSingleThreadScheduledExecutor(runnable ->
+                        new Thread(runnable, "RecoveryWorker")
+                );
+
         FileChangeDebounce debounce =
                 new FileChangeDebounce(
                         debounceExecutor,
@@ -102,25 +114,66 @@ public class Main {
                         )
                 );
 
+        DirectoryReconciler directoryReconciler =
+                new DirectoryReconciler(
+                        fileScanner,
+                        fileIndex,
+                        taskRouter
+                );
+
+        DirectoryReconciliationService reconciliationService =
+                new DirectoryReconciliationService(
+                        rescanExecutor,
+                        directoryReconciler
+                );
+
+        DirectoryRecoveryHandler directoryRecoveryHandler =
+                new DirectoryRecoveryHandler(
+                        reconciliationService
+                );
+
+        FileRecoveryCoordinator fileRecoveryCoordinator =
+                new FileRecoveryCoordinator(
+                        recoveryExecutor,
+                        taskRouter,
+                        MAX_RECOVERY_ATTEMPTS,
+                        directoryRecoveryHandler
+                );
+
         Thread[] workers = startWorkers(
                 queues,
                 filesStat,
-                fileIndex
+                fileIndex,
+                fileRecoveryCoordinator
         );
+
+        CountDownLatch watcherReady = new CountDownLatch(1);
 
         FileWatcher fileWatcher = new FileWatcher(
                 root,
                 debounce,
                 taskRouter,
                 watchRegistrar,
-                rescanExecutor,
-                fileScanner
+                reconciliationService,
+                watcherReady
         );
 
         Thread watcherThread =
                 new Thread(fileWatcher, "FileWatcher");
 
         try {
+            watcherThread.start();
+            watcherReady.await();
+
+            IOException startupFailure = fileWatcher.getIoException();
+            if (startupFailure != null) {
+                System.err.println(
+                        "Не удалось запустить FileWatcher: "
+                                + startupFailure.getMessage()
+                );
+                return;
+            }
+
             runInitialScan(
                     root,
                     taskRouter,
@@ -140,8 +193,6 @@ public class Main {
              * CountDownLatch.
              */
             printState(indexMap, filesStat);
-
-            watcherThread.start();
 
             System.out.println();
             System.out.println("Наблюдение за папкой запущено.");
@@ -175,6 +226,8 @@ public class Main {
 
             stopWorkers(queues, workers);
 
+            cancelScheduledRecoveries(recoveryExecutor);
+
             System.out.println();
             System.out.println("Итоговое состояние:");
 
@@ -203,7 +256,8 @@ public class Main {
     private static Thread[] startWorkers(
             List<BlockingQueue<FileTask>> queues,
             FilesStat filesStat,
-            FileIndex fileIndex
+            FileIndex fileIndex,
+            FileRecoveryCoordinator recoveryCoordinator
     ) {
         Thread[] workers = new Thread[queues.size()];
 
@@ -211,7 +265,8 @@ public class Main {
             FileWorker worker = new FileWorker(
                     queues.get(i),
                     filesStat,
-                    fileIndex
+                    fileIndex,
+                    recoveryCoordinator
             );
 
             workers[i] = new Thread(
@@ -277,6 +332,19 @@ public class Main {
         if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
             System.err.println(
                     executorName + " не удалось завершить"
+            );
+        }
+    }
+
+    private static void cancelScheduledRecoveries(
+            ScheduledExecutorService recoveryExecutor
+    ) throws InterruptedException {
+
+        recoveryExecutor.shutdownNow();
+
+        if (!recoveryExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+            System.err.println(
+                    "Recovery executor не удалось завершить"
             );
         }
     }

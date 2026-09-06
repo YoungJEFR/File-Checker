@@ -4,8 +4,8 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
+
 public final class WatchRegistrar {
 
     private final Map<WatchKey, Path> registeredDirectories;
