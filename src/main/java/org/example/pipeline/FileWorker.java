@@ -39,6 +39,13 @@ public class FileWorker implements Runnable {
                 return;
             }
 
+            if (workerTask instanceof BarrierTask(
+                    java.util.concurrent.CountDownLatch latch
+            )) {
+                latch.countDown();
+                continue;
+            }
+
             if (!(workerTask instanceof FileTask fileTask)) {
                 continue;
             }

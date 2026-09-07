@@ -1,6 +1,7 @@
 package org.example;
 
 import org.example.filescanner.FileScanner;
+import org.example.model.BarrierTask;
 import org.example.model.FileInfo;
 import org.example.model.FilesStat;
 import org.example.model.StopTask;
@@ -181,18 +182,13 @@ public class Main {
                     fileScanner
             );
 
+            awaitInitialProcessing(queues);
+
             System.out.println();
             System.out.println(
                     "Первоначальный обход директории закончен."
             );
 
-            /*
-             * На этом этапе producer закончил добавлять задачи,
-             * но workers теоретически ещё могут их обрабатывать.
-             *
-             * Позже здесь следует добавить Barrier +
-             * CountDownLatch.
-             */
             printState(indexMap, filesStat);
 
             System.out.println();
@@ -298,6 +294,19 @@ public class Main {
 
         producerThread.start();
         producerThread.join();
+    }
+
+    private static void awaitInitialProcessing(
+            List<BlockingQueue<WorkerTask>> queues
+    ) throws InterruptedException {
+        CountDownLatch barrierReached =
+                new CountDownLatch(queues.size());
+
+        for (BlockingQueue<WorkerTask> queue : queues) {
+            queue.put(new BarrierTask(barrierReached));
+        }
+
+        barrierReached.await();
     }
 
     private static void stopWatcher(
