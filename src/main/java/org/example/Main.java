@@ -211,6 +211,8 @@ public class Main {
 
             stopWatcher(watcherThread);
 
+            debounce.shutdown();
+
             shutdownExecutor(
                     rescanExecutor,
                     "Rescan executor"

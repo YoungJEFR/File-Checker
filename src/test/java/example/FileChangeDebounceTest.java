@@ -23,13 +23,14 @@ public class FileChangeDebounceTest {
     private FileChangeDebounce debounce;
     private Path path;
     private FileTask fileTask;
+    private TaskRouter router;
 
     @BeforeEach
     void setUp() {
         scheduler = Executors.newScheduledThreadPool(1);
         queue = new LinkedBlockingQueue<>();
         List<BlockingQueue<WorkerTask>> queues = List.of(queue);
-        TaskRouter router = new TaskRouter(queues);
+        router = new TaskRouter(queues);
 
         debounce = new FileChangeDebounce(scheduler, router);
 
@@ -41,7 +42,7 @@ public class FileChangeDebounceTest {
     @Test
     void manyRapidModifiesForSamePathShouldProduceOneTask()
             throws InterruptedException {
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 2000; i++) {
             debounce.debounceOnModify(fileTask);
         }
 
@@ -251,6 +252,149 @@ public class FileChangeDebounceTest {
         } finally {
             blockingRouter.allowFirstRouteToFinish.countDown();
         }
+    }
+
+    @Test
+    void createFollowedByModifyShouldPreserveOrder() throws InterruptedException {
+        FileTask fileTask1 = new FileTask(path, ChangeType.CREATED);
+        router.route(fileTask1);
+
+        FileTask fileTask2 = new FileTask(path, ChangeType.MODIFIED);
+        debounce.debounceOnModify(fileTask2);
+
+        WorkerTask result = queue.poll(
+                100,
+                TimeUnit.MILLISECONDS
+        );
+
+        FileTask task = assertInstanceOf(
+                FileTask.class,
+                result,
+                "Пришел другой файл"
+        );
+
+        assertEquals(path, task.path());
+        assertEquals(ChangeType.CREATED, task.changeType(), "Пришла другая задача");
+
+        WorkerTask unexpectedTask = queue.poll(
+                400,
+                TimeUnit.MILLISECONDS
+        );
+
+        assertNull(
+                unexpectedTask,
+                "MODIFIED появился раньше завершения debounce"
+        );
+
+        WorkerTask expectedTask = queue.poll(
+                1,
+                TimeUnit.SECONDS
+        );
+
+        task = assertInstanceOf(
+                FileTask.class,
+                expectedTask,
+                "Пришел другой файл"
+        );
+
+        assertEquals(path, task.path());
+        assertEquals(ChangeType.MODIFIED, task.changeType());
+
+        WorkerTask extraTask = queue.poll(
+                700,
+                TimeUnit.MILLISECONDS
+        );
+
+        assertNull(
+                extraTask,
+                "После CREATE и MODIFY появилась лишняя задача"
+        );
+    }
+
+    @Test
+    void modifyThenDeleteThenCreateShouldCancelStaleModify() throws InterruptedException {
+        FileTask modifiedTask = new FileTask(path, ChangeType.MODIFIED);
+
+        debounce.debounceOnModify(modifiedTask);
+        debounce.debounceCancel(path);
+
+        FileTask deletedTask = new FileTask(path, ChangeType.DELETED);
+
+        router.route(deletedTask);
+
+        WorkerTask result = queue.poll(
+                100,
+                TimeUnit.MILLISECONDS
+        );
+
+        FileTask deletedResult = assertInstanceOf(
+                FileTask.class,
+                result,
+                "Пришел другой файл"
+        );
+
+        assertEquals(path, deletedResult.path());
+        assertEquals(ChangeType.DELETED, deletedResult.changeType());
+
+        FileTask createdTask = new FileTask(path, ChangeType.CREATED);
+
+        router.route(createdTask);
+
+        result = queue.poll(
+                700,
+                TimeUnit.MILLISECONDS
+        );
+
+        FileTask createdResult = assertInstanceOf(
+                FileTask.class,
+                result,
+                "Пришел другой файл"
+        );
+
+        assertEquals(path, createdResult.path());
+        assertEquals(ChangeType.CREATED, createdResult.changeType());
+
+        result = queue.poll(
+                700,
+                TimeUnit.MILLISECONDS
+        );
+
+        assertNull(result, "В очереди есть еще объекты");
+
+    }
+
+    @Test
+    void shutdownShouldCancelPendingModify() throws InterruptedException {
+        debounce.debounceOnModify(fileTask);
+
+        debounce.shutdown();
+
+        WorkerTask result = queue.poll(
+                700,
+                TimeUnit.MILLISECONDS
+        );
+
+        assertNull(
+                result,
+                "После shutdown ожидающий MODIFY попал в очередь"
+        );
+    }
+
+    @Test
+    void modifyAfterShutdownShouldNotBeAccepted() throws InterruptedException {
+        debounce.shutdown();
+
+        debounce.debounceOnModify(fileTask);
+
+        WorkerTask result = queue.poll(
+                700,
+                TimeUnit.MILLISECONDS
+        );
+
+        assertNull(
+                result,
+                "Debounce принял новый MODIFY после shutdown"
+        );
     }
 
     @AfterEach

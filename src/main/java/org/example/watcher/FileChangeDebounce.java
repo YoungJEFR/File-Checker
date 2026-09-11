@@ -17,6 +17,8 @@ public class FileChangeDebounce {
     private final Map<Path, PendingDebounce> tasks = new ConcurrentHashMap<>();
     private final TaskRouter taskRouter;
     private final AtomicInteger numberTask = new AtomicInteger(0);
+    private final Object lifecycleLock = new Object();
+    private boolean acceptingRequest = true;
 
     public FileChangeDebounce(
             ScheduledExecutorService scheduled,
@@ -27,39 +29,62 @@ public class FileChangeDebounce {
     }
 
     public void debounceOnModify(FileTask fileTask) {
-        tasks.compute(fileTask.path(), (path, oldTask) -> {
-            if (oldTask != null) {
-                oldTask.getExpectedFuture().cancel(false);
+        synchronized (lifecycleLock) {
+            if (!acceptingRequest) {
+                return;
             }
 
-            int currentNumber = numberTask.getAndIncrement();
+            tasks.compute(fileTask.path(), (path, oldTask) -> {
+                if (oldTask != null) {
+                    oldTask.getExpectedFuture().cancel(false);
+                }
 
-            ScheduledFuture<?> newTask = scheduled.schedule(() -> {
-                        try {
-                            taskRouter.route(fileTask);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            return;
-                        } finally {
-                            tasks.computeIfPresent(path, (key, actualPending) -> {
-                                if (actualPending.getNumberTask() == currentNumber) {
-                                    return null;
-                                }
+                int currentNumber = numberTask.getAndIncrement();
 
-                                return actualPending;
-                            });
-                        }
-                    },
-                    500,
-                    TimeUnit.MILLISECONDS
-            );
+                ScheduledFuture<?> newTask = scheduled.schedule(() -> {
+                            try {
+                                taskRouter.route(fileTask);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                return;
+                            } finally {
+                                tasks.computeIfPresent(path, (key, actualPending) -> {
+                                    if (actualPending.getNumberTask() == currentNumber) {
+                                        return null;
+                                    }
 
-            PendingDebounce pendingDebounce = new PendingDebounce(currentNumber, newTask);
+                                    return actualPending;
+                                });
+                            }
+                        },
+                        500,
+                        TimeUnit.MILLISECONDS
+                );
 
-            return pendingDebounce;
-        });
+                PendingDebounce pendingDebounce = new PendingDebounce(currentNumber, newTask);
+
+                return pendingDebounce;
+            });
+        }
     }
 
+
+    public void shutdown() {
+        synchronized (lifecycleLock) {
+            if (!acceptingRequest) {
+                return;
+            }
+
+
+            tasks.forEach((key, task) -> {
+                task.getExpectedFuture().cancel(false);
+            });
+
+            tasks.clear();
+
+            acceptingRequest = false;
+        }
+    }
 
     public void debounceCancel(Path path) {
         PendingDebounce pendingDebounce = tasks.remove(path);
