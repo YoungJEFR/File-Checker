@@ -394,6 +394,72 @@ class FileRecoveryCoordinatorTest {
         assertNull(queue.poll());
     }
 
+    @Test
+    void failureAfterShutdownShouldNotScheduleRetry() {
+        FileRecoveryCoordinator coordinator = coordinatorWithThreeAttempts();
+        FileTask failureTask = normalTask("a.md");
+
+        coordinator.shutdown();
+
+        boolean recoveryStarted = coordinator.onFailure(
+                failureTask,
+                new IOException("failure after shutdown")
+        );
+
+        assertFalse(recoveryStarted);
+        assertEquals(
+                0,
+                recoveryScheduler.scheduledCount(),
+                "После shutdown была запланирована retry-задача"
+        );
+        assertEquals(0, exhaustedHandler.callCount());
+        assertNull(queue.poll());
+    }
+
+    @Test
+    void shutdownShouldCancelAllPendingRetries() {
+        FileRecoveryCoordinator coordinator = coordinatorWithThreeAttempts();
+        IOException failure = new IOException("test failure");
+
+        coordinator.onFailure(normalTask("a.md"), failure);
+        coordinator.onFailure(normalTask("b.md"), failure);
+
+        assertEquals(2, recoveryScheduler.scheduledCount());
+        assertFalse(recoveryScheduler.isCancelled(0));
+        assertFalse(recoveryScheduler.isCancelled(1));
+
+        coordinator.shutdown();
+
+        assertTrue(recoveryScheduler.isCancelled(0));
+        assertTrue(recoveryScheduler.isCancelled(1));
+
+        recoveryScheduler.runTask(0);
+        recoveryScheduler.runTask(1);
+
+        assertNull(
+                queue.poll(),
+                "Отменённая retry-задача попала в очередь после shutdown"
+        );
+    }
+
+    @Test
+    void repeatedShutdownShouldBeSafe() {
+        FileRecoveryCoordinator coordinator = coordinatorWithThreeAttempts();
+
+        coordinator.onFailure(
+                normalTask("a.md"),
+                new IOException("test failure")
+        );
+
+        assertDoesNotThrow(() -> {
+            coordinator.shutdown();
+            coordinator.shutdown();
+        });
+
+        assertTrue(recoveryScheduler.isCancelled(0));
+        assertNull(queue.poll());
+    }
+
     private FileRecoveryCoordinator coordinatorWithThreeAttempts() {
         return new FileRecoveryCoordinator(
                 recoveryScheduler,

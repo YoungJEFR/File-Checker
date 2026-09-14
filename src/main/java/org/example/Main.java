@@ -213,6 +213,10 @@ public class Main {
 
             debounce.shutdown();
 
+            reconciliationService.shutdown();
+
+            fileRecoveryCoordinator.shutdown();
+
             shutdownExecutor(
                     rescanExecutor,
                     "Rescan executor"
@@ -223,9 +227,9 @@ public class Main {
                     "Debounce executor"
             );
 
-            stopWorkers(queues, workers);
-
             cancelScheduledRecoveries(recoveryExecutor);
+
+            stopWorkers(queues, workers);
 
             System.out.println();
             System.out.println("Итоговое состояние:");

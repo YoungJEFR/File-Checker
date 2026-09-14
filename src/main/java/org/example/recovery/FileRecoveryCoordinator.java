@@ -18,6 +18,8 @@ public class FileRecoveryCoordinator {
     private final TaskRouter router;
     private final int maxAttempts;
     private final RecoveryExhaustedHandler exhaustedHandler;
+    private final Object lifecycleLock = new Object();
+    private boolean acceptingRequests = true;
 
     private static final long INITIAL_DELAY = 500L;
 
@@ -47,79 +49,98 @@ public class FileRecoveryCoordinator {
             FileTask failedTask,
             IOException cause
     ) {
+        synchronized (lifecycleLock) {
+            if (!acceptingRequests) {
+                return false;
+            }
 
-        if (failedTask.taskSource() == TaskSource.NORMAL) {
-            AtomicBoolean recoveryStarted = new AtomicBoolean(false);
-            activeRecoveries.computeIfAbsent(
-                    failedTask.path(),
-                    path -> {
-                        ScheduledFuture<?> retryFuture = recoveryScheduler.schedule(() -> {
+            if (failedTask.taskSource() == TaskSource.NORMAL) {
+                AtomicBoolean recoveryStarted = new AtomicBoolean(false);
+                activeRecoveries.computeIfAbsent(
+                        failedTask.path(),
+                        path -> {
+                            ScheduledFuture<?> retryFuture = recoveryScheduler.schedule(() -> {
+                                        try {
+                                            router.route(new FileTask(
+                                                    failedTask.path(),
+                                                    failedTask.changeType(),
+                                                    TaskSource.RECOVERY
+                                            ));
+                                        } catch (InterruptedException e) {
+                                            Thread.currentThread().interrupt();
+                                            return;
+                                        }
+                                    },
+                                    INITIAL_DELAY,
+                                    TimeUnit.MILLISECONDS
+                            );
+                            RecoveryState newState = new RecoveryState(
+                                    1,
+                                    retryFuture
+                            );
+                            recoveryStarted.set(true);
+                            return newState;
+                        }
+                );
+                return recoveryStarted.get();
+            } else if (failedTask.taskSource() == TaskSource.RECOVERY) {
+                RecoveryState state = activeRecoveries.get(failedTask.path());
+                if (state != null) {
+                    if (state.attemptCount() < maxAttempts) {
+                        long delay = INITIAL_DELAY * (1L << state.attemptCount());
+                        ScheduledFuture<?> newScheduledFuture = recoveryScheduler.schedule(() -> {
                                     try {
-                                        router.route(new FileTask(
-                                                failedTask.path(),
-                                                failedTask.changeType(),
-                                                TaskSource.RECOVERY
-                                        ));
+                                        router.route(failedTask);
                                     } catch (InterruptedException e) {
                                         Thread.currentThread().interrupt();
                                         return;
                                     }
                                 },
-                                INITIAL_DELAY,
+                                delay,
                                 TimeUnit.MILLISECONDS
                         );
+                        int count = state.attemptCount() + 1;
                         RecoveryState newState = new RecoveryState(
-                                1,
-                                retryFuture
+                                count,
+                                newScheduledFuture
                         );
-                        recoveryStarted.set(true);
-                        return newState;
-                    }
-            );
-            return recoveryStarted.get();
-        } else if (failedTask.taskSource() == TaskSource.RECOVERY) {
-            RecoveryState state = activeRecoveries.get(failedTask.path());
-            if (state != null) {
-                if (state.attemptCount() < maxAttempts) {
-                    long delay = INITIAL_DELAY * (1L << state.attemptCount());
-                    ScheduledFuture<?> newScheduledFuture = recoveryScheduler.schedule(() -> {
-                                try {
-                                    router.route(failedTask);
-                                } catch (InterruptedException e) {
-                                    Thread.currentThread().interrupt();
-                                    return;
-                                }
-                            },
-                            delay,
-                            TimeUnit.MILLISECONDS
-                    );
-                    int count = state.attemptCount() + 1;
-                    RecoveryState newState = new RecoveryState(
-                            count,
-                            newScheduledFuture
-                    );
-                    activeRecoveries.put(failedTask.path(), newState);
-                } else {
-                    boolean removed = activeRecoveries.remove(
-                            failedTask.path(),
-                            state
-                    );
+                        activeRecoveries.put(failedTask.path(), newState);
+                    } else {
+                        boolean removed = activeRecoveries.remove(
+                                failedTask.path(),
+                                state
+                        );
 
-                    if (removed) {
-                        exhaustedHandler.handle(failedTask, cause);
+                        if (removed) {
+                            exhaustedHandler.handle(failedTask, cause);
+                        }
                     }
                 }
+                return false;
+            } else if (failedTask.taskSource() == TaskSource.RECONCILIATION) {
+                System.err.println("Recovery failed: " + cause.getMessage() + ". Путь " + failedTask.path());
+                cause.printStackTrace(System.err);
+
+                return false;
+            } else {
+                return false;
             }
-            return false;
-        } else if (failedTask.taskSource() == TaskSource.RECONCILIATION) {
-            System.err.println("Recovery failed: " + cause.getMessage() + ". Путь " + failedTask.path());
-            cause.printStackTrace(System.err);
-
-            return false;
-        } else {
-            return false;
         }
+    }
 
+    public void shutdown() {
+        synchronized (lifecycleLock) {
+            if (!acceptingRequests) {
+                return;
+            }
+            acceptingRequests = false;
+
+            for (RecoveryState state : activeRecoveries.values()) {
+                state.scheduledFuture().cancel(false);
+            }
+
+                activeRecoveries.clear();
+        }
     }
 
     public void onSuccess(Path path) {

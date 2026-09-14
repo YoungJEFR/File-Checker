@@ -166,6 +166,75 @@ class DirectoryReconciliationServiceTest {
         assertEquals(2, calls.get());
     }
 
+    @Test
+    void requestAfterShutdownShouldNotStartReconciliation() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        DirectoryReconciliationService service = service(directory ->
+                calls.incrementAndGet()
+        );
+
+        service.shutdown();
+        service.request(tempDir);
+        awaitExecutor();
+
+        assertEquals(
+                0,
+                calls.get(),
+                "Reconciliation был запущен после shutdown"
+        );
+    }
+
+    @Test
+    void shutdownDuringRunningReconciliationShouldFinishAcceptedPassesOnly()
+            throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+
+        CountDownLatch firstPassStarted = new CountDownLatch(1);
+        CountDownLatch allowFirstPassToFinish = new CountDownLatch(1);
+        CountDownLatch secondPassFinished = new CountDownLatch(1);
+        DirectoryReconciliationService service = service(directory -> {
+            int call = calls.incrementAndGet();
+            if (call == 1) {
+                firstPassStarted.countDown();
+                allowFirstPassToFinish.await();
+            } else if (call == 2) {
+                secondPassFinished.countDown();
+            }
+        });
+
+        service.request(tempDir);
+
+        try {
+            assertTrue(
+                    firstPassStarted.await(2, TimeUnit.SECONDS),
+                    "Первый reconciliation не начался"
+            );
+
+            service.request(tempDir);
+
+            service.shutdown();
+
+            service.request(tempDir);
+
+            allowFirstPassToFinish.countDown();
+
+            assertTrue(
+                    secondPassFinished.await(2, TimeUnit.SECONDS),
+                    "Принятый до shutdown второй проход не завершился"
+            );
+
+            awaitExecutor();
+
+            assertEquals(
+                    2,
+                    calls.get(),
+                    "После shutdown был выполнен лишний reconciliation"
+            );
+        } finally {
+            allowFirstPassToFinish.countDown();
+        }
+    }
+
     private DirectoryReconciliationService service(
             ReconciliationAction action
     ) {

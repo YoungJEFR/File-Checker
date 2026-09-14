@@ -9,6 +9,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class DirectoryReconciliationService {
     private final ExecutorService executorService;
     private final DirectoryReconciler directoryReconciler;
+    private final Object lifecycleLock = new Object();
+    private boolean acceptingRequests = true;
 
     private final ConcurrentHashMap<Path, ReconciliationStatus> reconciliationStatusMap
             = new ConcurrentHashMap<>();
@@ -22,27 +24,43 @@ public class DirectoryReconciliationService {
     }
 
     public void request(Path directory) {
-        AtomicBoolean shouldStart = new AtomicBoolean(false);
-        Path normalizedDirectory = directory.normalize().toAbsolutePath();
-
-        reconciliationStatusMap.compute(normalizedDirectory, (path, reconciliationStatus) -> {
-            if (reconciliationStatus == null) {
-                shouldStart.set(true);
-                return ReconciliationStatus.RUNNING;
+        synchronized (lifecycleLock) {
+            if (!acceptingRequests) {
+                return;
             }
 
-            return ReconciliationStatus.RUNNING_AGAIN;
-        });
+            AtomicBoolean shouldStart = new AtomicBoolean(false);
+            Path normalizedDirectory = directory.normalize().toAbsolutePath();
 
-        if (shouldStart.get()) {
-            executorService.submit(() -> {
-                runReconciliation(normalizedDirectory);
+            reconciliationStatusMap.compute(normalizedDirectory, (path, reconciliationStatus) -> {
+                if (reconciliationStatus == null) {
+                    shouldStart.set(true);
+                    return ReconciliationStatus.RUNNING;
+                }
+
+                return ReconciliationStatus.RUNNING_AGAIN;
             });
+
+            if (shouldStart.get()) {
+                executorService.submit(() -> {
+                    runReconciliation(normalizedDirectory);
+                });
+            }
+        }
+    }
+
+    public void shutdown() {
+        synchronized (lifecycleLock) {
+            if (!acceptingRequests) {
+                return;
+            }
+
+            acceptingRequests = false;
         }
     }
 
     private void runReconciliation(Path directory) {
-        while(true){
+        while (true) {
             AtomicBoolean shouldRunAgain = new AtomicBoolean(false);
 
             try {
