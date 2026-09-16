@@ -78,6 +78,9 @@ public class Main {
                 new LongAdder()
         );
 
+
+        boolean wasInterrupted = false;
+
         ConcurrentHashMap<Path, FileInfo> indexMap =
                 new ConcurrentHashMap<>();
 
@@ -209,7 +212,11 @@ public class Main {
             System.out.println();
             System.out.println("Останавливаем FileWatcher...");
 
-            stopWatcher(watcherThread);
+            try {
+                stopWatcher(watcherThread);
+            } catch (InterruptedException e) {
+                wasInterrupted = true;
+            }
 
             debounce.shutdown();
 
@@ -217,19 +224,35 @@ public class Main {
 
             fileRecoveryCoordinator.shutdown();
 
-            shutdownExecutor(
-                    rescanExecutor,
-                    "Rescan executor"
-            );
+            try {
+                shutdownExecutor(
+                        rescanExecutor,
+                        "Rescan executor"
+                );
+            } catch (InterruptedException e) {
+                wasInterrupted = true;
+            }
 
-            shutdownExecutor(
-                    debounceExecutor,
-                    "Debounce executor"
-            );
+            try {
+                shutdownExecutor(
+                        debounceExecutor,
+                        "Debounce executor"
+                );
+            } catch (InterruptedException e) {
+                wasInterrupted = true;
+            }
 
-            cancelScheduledRecoveries(recoveryExecutor);
+            try {
+                cancelScheduledRecoveries(recoveryExecutor);
+            } catch (InterruptedException e) {
+                wasInterrupted = true;
+            }
 
-            stopWorkers(queues, workers);
+            try {
+                stopWorkers(queues, workers);
+            } catch (InterruptedException e) {
+                wasInterrupted = true;
+            }
 
             System.out.println();
             System.out.println("Итоговое состояние:");
@@ -238,6 +261,10 @@ public class Main {
 
             System.out.println();
             System.out.println("Программа завершена.");
+
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -369,13 +396,34 @@ public class Main {
             List<BlockingQueue<WorkerTask>> queues,
             Thread[] workers
     ) throws InterruptedException {
+        boolean wasInterrupted = false;
 
         for (BlockingQueue<WorkerTask> queue : queues) {
-            queue.put(new StopTask());
+            boolean stopSent = false;
+            while (!stopSent) {
+                try {
+                    queue.put(new StopTask());
+                    stopSent = true;
+                } catch (InterruptedException e) {
+                    wasInterrupted = true;
+                }
+            }
         }
 
         for (Thread worker : workers) {
-            worker.join();
+            boolean workerJoined = false;
+            while (!workerJoined) {
+                try {
+                    worker.join();
+                    workerJoined = true;
+                } catch (InterruptedException e) {
+                    wasInterrupted = true;
+                }
+            }
+        }
+
+        if (wasInterrupted) {
+            throw new InterruptedException();
         }
     }
 
