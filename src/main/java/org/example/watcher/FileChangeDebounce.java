@@ -75,13 +75,11 @@ public class FileChangeDebounce {
                 return;
             }
 
-
             tasks.forEach((key, task) -> {
                 task.getExpectedFuture().cancel(false);
             });
 
             tasks.clear();
-
             acceptingRequest = false;
         }
     }

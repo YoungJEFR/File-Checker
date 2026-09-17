@@ -8,14 +8,15 @@
 
 ## Текущее состояние
 
-Завершены этапы 6, 8 и 10: корректный initial scan, модель служебных задач,
-устойчивость и восстановление индекса. На этапе 7 устранены основные
-конкурентные гонки debounce.
+Завершены этапы 6, 7, 8 и 10: корректный initial scan, надёжный debounce,
+модель служебных задач, устойчивость и восстановление индекса. Этап 9 близок к
+завершению: lifecycle вынесен в `FileIndexerService` и покрыт конкурентными
+тестами, но `Main` ещё использует прежнюю ручную сборку компонентов.
 
 Последний полный прогон:
 
 ```text
-Tests run: 49, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 83, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
@@ -36,12 +37,18 @@ BUILD SUCCESS
 - сообщать `Main` об успешном или ошибочном запуске watcher;
 - использовать отдельные `FileTask`, `BarrierTask` и `StopTask`;
 - дожидаться обработки initial scan во всех partition-очередях перед выводом
-  первоначального индекса.
+  первоначального индекса;
+- объединять 2000 быстрых `MODIFY` в одну итоговую задачу;
+- отменять отложенный `MODIFY` при `DELETE` и shutdown;
+- управлять состояниями `NEW`, `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`;
+- корректно завершаться при конкурентных `start()` и `shutdown()`;
+- дожидаться первого shutdown при повторном конкурентном вызове;
+- завершать очистку при interruption и восстанавливать interruption-флаг.
 
 Текущая задача:
 
-> Завершить оставшиеся сценарии этапа 7: последовательности файловых событий,
-> большую серию `MODIFY` и shutdown во время ожидания debounce.
+> Перевести `Main` на `FileIndexerService`, завершить тесты переходов lifecycle
+> и проверить shutdown при заполненных Worker-очередях.
 
 ---
 
@@ -201,8 +208,7 @@ Initial index is ready
 
 # Этап 7 — Надёжный debounce
 
-Статус: основные конкурентные гонки исправлены, дополнительные сценарии в
-работе.
+Статус: завершён.
 
 - [x] Откладывать `MODIFY` на 500 мс
 - [x] Отменять предыдущую ожидающую задачу
@@ -217,10 +223,10 @@ Initial index is ready
 - [x] Проверить, что повторный `MODIFY` перезапускает задержку
 - [x] Проверить отмену ожидающего `MODIFY`
 - [x] Воспроизвести и закрыть гонку старого callback с новой задачей
-- [ ] Определить поведение `CREATE → MODIFY`
-- [ ] Определить поведение `MODIFY → DELETE → CREATE`
-- [ ] Добавить тест большого количества быстрых `MODIFY`
-- [ ] Добавить тест shutdown во время ожидания debounce
+- [x] Определить поведение `CREATE → MODIFY`
+- [x] Определить поведение `MODIFY → DELETE → CREATE`
+- [x] Добавить тест 2000 быстрых `MODIFY`
+- [x] Добавить тест shutdown во время ожидания debounce
 
 ---
 
@@ -250,6 +256,9 @@ WorkerTask
 
 # Этап 9 — Lifecycle и shutdown
 
+Статус: основная реализация готова, остаются интеграция с `Main`, крайние
+переходы состояния и shutdown заполненных очередей.
+
 - [x] Прерывать watcher
 - [x] Закрывать его локальный `WatchService`
 - [x] Вызывать `shutdown()` для executor-ов
@@ -257,15 +266,20 @@ WorkerTask
 - [x] Использовать `shutdownNow()` после таймаута
 - [x] Останавливать Worker после источников обычных задач
 - [x] Останавливать recovery scheduler
-- [ ] Не принимать новые debounce, recovery и reconciliation-запросы после shutdown
-- [ ] Гарантировать cleanup остальных ресурсов, если один шаг был прерван
+- [x] Не принимать новые debounce, recovery и reconciliation-запросы после shutdown
+- [x] Гарантировать cleanup остальных ресурсов, если один шаг был прерван
 - [x] Убрать `STOP` на основе специального пути
 - [ ] Проверить shutdown при заполненных очередях
-- [ ] Проверить shutdown во время initial scan
-- [ ] Проверить shutdown во время reconciliation
-- [ ] Проверить shutdown во время recovery
-- [ ] Проверить shutdown во время debounce
-- [ ] Вынести lifecycle в `FileIndexerService`
+- [x] Проверить конкурентные `start()` и `shutdown()`
+- [x] Проверить shutdown во время reconciliation
+- [x] Проверить shutdown во время recovery
+- [x] Проверить shutdown во время debounce
+- [x] Вынести lifecycle в `FileIndexerService`
+- [x] Проверить два конкурентных вызова `shutdown()`
+- [x] Проверить cleanup и восстановление флага при interruption
+- [x] Проверить отсутствие живых Worker, watcher и producer после shutdown
+- [ ] Перевести `Main` на `FileIndexerService`
+- [ ] Проверить переходы: shutdown до start, повторный start, start после STOPPED
 - [ ] Реализовать `AutoCloseable`
 
 Целевой порядок:
@@ -390,9 +404,17 @@ Create final snapshot
 - [x] Повторный `MODIFY` перезапускает debounce-задержку
 - [x] Отмена debounce не пропускает ожидающую задачу в очередь
 - [x] Старый callback не удаляет более новую ожидающую задачу
+- [x] `CREATE → MODIFY` сохраняет порядок
+- [x] `MODIFY → DELETE → CREATE` отменяет устаревший `MODIFY`
+- [x] Debounce не принимает задачи после shutdown
+- [x] Recovery не принимает retry после shutdown
+- [x] Reconciliation не принимает запрос после shutdown
+- [x] Конкурентные `start()` и `shutdown()` не оставляют живые потоки
+- [x] Два конкурентных `shutdown()` ждут полного завершения
+- [x] Прерванный shutdown завершает cleanup и восстанавливает флаг
 
-Всего: 49 тестов в 13 тестовых классах. Последний полный прогон завершён без
-ошибок.
+Всего: 58 обычных сценариев и 25 повторных lifecycle-запусков — 83 выполнения
+в 14 тестовых классах. Последний полный прогон завершён без ошибок.
 
 ### Осталось
 
@@ -401,11 +423,10 @@ Create final snapshot
 - [ ] Unit-тест `FilesStat`
 - [ ] Unit-тест `TaskRouter`
 - [ ] Unit-тест `WatchRegistrar`
-- [ ] Большая нагрузка на `FileChangeDebounce`
 - [ ] `CREATE → MODIFY → DELETE`
 - [ ] Перемещение заполненной директории
 - [ ] Shutdown под нагрузкой
-- [ ] Проверка отсутствия оставшихся потоков после полного lifecycle
+- [ ] Переходы lifecycle до запуска, после запуска и после остановки
 
 Тесты не должны зависеть от произвольного `Thread.sleep()`. Для синхронизации
 нужно использовать наблюдаемое состояние, `CountDownLatch`, `CyclicBarrier` или
@@ -436,6 +457,13 @@ Create final snapshot
 
 ```mermaid
 flowchart TD
+    Lifecycle[FileIndexerService] -. создаёт и останавливает .-> Producer
+    Lifecycle -. управляет .-> Watcher
+    Lifecycle -. управляет .-> Workers
+    Lifecycle -. управляет .-> Debounce
+    Lifecycle -. управляет .-> Service
+    Lifecycle -. управляет .-> Recovery
+
     Scanner[FileScanner] --> Producer[FileProducer]
     Producer --> Router[TaskRouter]
 
@@ -477,10 +505,14 @@ flowchart TD
 9. [x] Дождаться всех initial-задач перед `printState()`
 10. [x] Добавить regression-тесты initial scan
 11. [x] Исправить конкурентные гонки debounce
-12. [ ] Завершить событийные и shutdown-тесты debounce
-13. [ ] Усилить lifecycle и shutdown
-14. [ ] Инкапсулировать индекс и статистику
-15. [ ] Перейти к поиску
+12. [x] Завершить событийные и shutdown-тесты debounce
+13. [x] Вынести lifecycle в `FileIndexerService`
+14. [x] Закрыть основные гонки `start()` и `shutdown()`
+15. [ ] Перевести `Main` на `FileIndexerService`
+16. [ ] Проверить крайние переходы lifecycle и заполненные очереди
+17. [ ] Реализовать `AutoCloseable`
+18. [ ] Инкапсулировать индекс и статистику
+19. [ ] Перейти к поиску
 
 ---
 

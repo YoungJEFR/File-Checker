@@ -126,6 +126,7 @@ public class FileWatcher implements Runnable {
         } catch (java.io.IOException e) {
             e.printStackTrace();
             startupFailure = e;
+        } finally {
             watcherReady.countDown();
         }
     }
