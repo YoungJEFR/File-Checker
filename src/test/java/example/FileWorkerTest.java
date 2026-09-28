@@ -1,36 +1,26 @@
 package example;
 
-import org.example.model.ChangeType;
-import org.example.model.BarrierTask;
-import org.example.model.FileInfo;
-import org.example.model.FileTask;
-import org.example.model.FilesStat;
-import org.example.model.StopTask;
-import org.example.model.WorkerTask;
+import org.example.model.*;
 import org.example.pipeline.FileWorker;
 import org.example.processor.FileIndex;
+import org.example.processor.FileProcessor;
+import org.example.processor.FileTaskProcessor;
 import org.example.recovery.FileRecoveryCoordinator;
 import org.example.route.TaskRouter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 class FileWorkerTest {
 
@@ -50,6 +40,211 @@ class FileWorkerTest {
                 new LongAdder()
         );
         fileIndex = new FileIndex(indexMap);
+    }
+
+    @Test
+    @Timeout(value = 5, unit = TimeUnit.SECONDS)
+    void injectedProcessorShouldBlockAndResumeWorker()
+            throws Exception {
+        Path file = Files.write(
+                tempDir.resolve("file.md"),
+                new byte[10]
+        );
+        BlockingQueue<WorkerTask> queue = new ArrayBlockingQueue<>(5);
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch allowWorker = new CountDownLatch(1);
+        ScheduledExecutorService recoveryScheduler =
+                Executors.newSingleThreadScheduledExecutor();
+        TaskRouter router = new TaskRouter(List.of(queue));
+        FileRecoveryCoordinator recoveryCoordinator =
+                new FileRecoveryCoordinator(
+                        recoveryScheduler,
+                        router,
+                        3,
+                        (failedTask, cause) -> { }
+                );
+        FileTaskProcessor processor = fileTask -> {
+            workerEntered.countDown();
+            allowWorker.await();
+            return FileProcessor.process(fileTask);
+        };
+
+        FileWorker fileWorker = new FileWorker(
+                queue,
+                filesStat,
+                fileIndex,
+                recoveryCoordinator,
+                processor
+        );
+        Thread workerThread = new Thread(
+                fileWorker,
+                "ControlledFileWorkerTest"
+        );
+
+        try {
+            queue.put(new FileTask(file, ChangeType.CREATED));
+            workerThread.start();
+
+            assertTrue(
+                    workerEntered.await(2, TimeUnit.SECONDS),
+                    "Worker не вошёл в тестовый processor"
+            );
+            assertTrue(
+                    workerThread.isAlive(),
+                    "Worker завершился до разрешения обработки"
+            );
+            assertNull(
+                    fileIndex.getFileInfo(file),
+                    "Файл попал в индекс до освобождения processor"
+            );
+
+            queue.put(new StopTask());
+            allowWorker.countDown();
+            workerThread.join(2_000);
+
+            assertFalse(
+                    workerThread.isAlive(),
+                    "Worker не завершился после StopTask"
+            );
+            assertNotNull(fileIndex.getFileInfo(file));
+            assertEquals(1, filesStat.getCountFiles().get());
+            assertEquals(10, filesStat.getCountByteFiles().sum());
+        } finally {
+            allowWorker.countDown();
+            queue.offer(new StopTask());
+            workerThread.interrupt();
+            workerThread.join(2_000);
+
+            recoveryScheduler.shutdownNow();
+            recoveryScheduler.awaitTermination(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    @Timeout(value = 5, unit = TimeUnit.SECONDS)
+    void fullQueueShouldProcessFileTasksBeforeStopTask()
+            throws Exception {
+        Path firstFile = Files.write(
+                tempDir.resolve("first.md"),
+                new byte[10]
+        );
+        Path secondFile = Files.write(
+                tempDir.resolve("second.md"),
+                new byte[20]
+        );
+        BlockingQueue<WorkerTask> queue = new ArrayBlockingQueue<>(1);
+        CountDownLatch workerEntered = new CountDownLatch(1);
+        CountDownLatch allowWorker = new CountDownLatch(1);
+        CountDownLatch stopPutStarted = new CountDownLatch(1);
+        CountDownLatch stopPutCompleted = new CountDownLatch(1);
+        AtomicReference<Throwable> stopFailure = new AtomicReference<>();
+        ScheduledExecutorService recoveryScheduler =
+                Executors.newSingleThreadScheduledExecutor();
+        TaskRouter router = new TaskRouter(List.of(queue));
+        FileRecoveryCoordinator recoveryCoordinator =
+                new FileRecoveryCoordinator(
+                        recoveryScheduler,
+                        router,
+                        3,
+                        (failedTask, cause) -> { }
+                );
+        FileTaskProcessor processor = fileTask -> {
+            workerEntered.countDown();
+            allowWorker.await();
+            return FileProcessor.process(fileTask);
+        };
+        Thread workerThread = new Thread(
+                new FileWorker(
+                        queue,
+                        filesStat,
+                        fileIndex,
+                        recoveryCoordinator,
+                        processor
+                ),
+                "FullQueueFileWorkerTest"
+        );
+        Thread stopSender = new Thread(() -> {
+            stopPutStarted.countDown();
+            try {
+                queue.put(new StopTask());
+                stopPutCompleted.countDown();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                stopFailure.set(e);
+            } catch (Throwable failure) {
+                stopFailure.set(failure);
+            }
+        }, "FullQueueStopSenderTest");
+
+        try {
+            queue.put(new FileTask(firstFile, ChangeType.CREATED));
+            workerThread.start();
+
+            assertTrue(
+                    workerEntered.await(2, TimeUnit.SECONDS),
+                    "Worker не начал обработку первого файла"
+            );
+
+            queue.put(new FileTask(secondFile, ChangeType.CREATED));
+            assertEquals(
+                    0,
+                    queue.remainingCapacity(),
+                    "Очередь не была полностью заполнена"
+            );
+
+            stopSender.start();
+            assertTrue(
+                    stopPutStarted.await(2, TimeUnit.SECONDS),
+                    "Поток не начал отправку StopTask"
+            );
+            assertEquals(
+                    1,
+                    stopPutCompleted.getCount(),
+                    "StopTask попал в заполненную очередь"
+            );
+            assertTrue(
+                    stopSender.isAlive(),
+                    "Отправитель StopTask не ожидал свободного места"
+            );
+
+            allowWorker.countDown();
+
+            assertTrue(
+                    stopPutCompleted.await(2, TimeUnit.SECONDS),
+                    "StopTask не был добавлен после освобождения места"
+            );
+            stopSender.join(2_000);
+            workerThread.join(2_000);
+
+            assertNull(
+                    stopFailure.get(),
+                    "Отправка StopTask завершилась с ошибкой"
+            );
+            assertFalse(
+                    stopSender.isAlive(),
+                    "Поток отправки StopTask не завершился"
+            );
+            assertFalse(
+                    workerThread.isAlive(),
+                    "Worker не завершился после StopTask"
+            );
+            assertNotNull(fileIndex.getFileInfo(firstFile));
+            assertNotNull(fileIndex.getFileInfo(secondFile));
+            assertEquals(2, filesStat.getCountFiles().get());
+            assertEquals(30, filesStat.getCountByteFiles().sum());
+            assertTrue(queue.isEmpty());
+        } finally {
+            allowWorker.countDown();
+            queue.offer(new StopTask());
+
+            stopSender.interrupt();
+            workerThread.interrupt();
+            stopSender.join(2_000);
+            workerThread.join(2_000);
+
+            recoveryScheduler.shutdownNow();
+            recoveryScheduler.awaitTermination(2, TimeUnit.SECONDS);
+        }
     }
 
     @Test
@@ -205,7 +400,8 @@ class FileWorkerTest {
                         recoveryScheduler,
                         router,
                         3,
-                        (failedTask, cause) -> { }
+                        (failedTask, cause) -> {
+                        }
                 );
         Thread workerThread = new Thread(
                 new FileWorker(
@@ -259,7 +455,8 @@ class FileWorkerTest {
                         recoveryScheduler,
                         router,
                         3,
-                        (failedTask, cause) -> { }
+                        (failedTask, cause) -> {
+                        }
                 );
 
         for (FileTask task : tasks) {

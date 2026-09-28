@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -33,6 +34,47 @@ class FileIndexTest {
                 () -> snapshot.add(secondPath)
         );
     }
+
+    @Test
+    void snapshotMapShouldBeImmutableAndDetachedFromIndex() {
+        FileIndex fileIndex =
+                new FileIndex(new ConcurrentHashMap<>());
+
+        Path firstPath = Path.of("a.md");
+        Path secondPath = Path.of("b.md");
+
+        FileInfo firstFile = fileInfo(firstPath);
+        FileInfo secondFile = fileInfo(secondPath);
+
+        fileIndex.addToMap(firstFile);
+
+        Map<Path, FileInfo> oldSnapshot =
+                fileIndex.snapshotMap();
+
+        fileIndex.addToMap(secondFile);
+
+        Map<Path, FileInfo> newSnapshot =
+                fileIndex.snapshotMap();
+
+        assertEquals(
+                Map.of(firstPath, firstFile),
+                oldSnapshot
+        );
+
+        assertEquals(
+                Map.of(
+                        firstPath, firstFile,
+                        secondPath, secondFile
+                ),
+                newSnapshot
+        );
+
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> oldSnapshot.put(secondPath, secondFile)
+        );
+    }
+
 
     private FileInfo fileInfo(Path path) {
         return new FileInfo(

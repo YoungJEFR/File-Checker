@@ -3,10 +3,12 @@ package org.example.pipeline;
 import org.example.model.*;
 import org.example.processor.FileIndex;
 import org.example.processor.FileProcessor;
+import org.example.processor.FileTaskProcessor;
 import org.example.recovery.FileRecoveryCoordinator;
 
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
+import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
 
 public class FileWorker implements Runnable {
@@ -14,13 +16,38 @@ public class FileWorker implements Runnable {
     private final FilesStat filesStat;
     private final FileIndex fileIndex;
     private final FileRecoveryCoordinator fileRecoveryCoordinator;
+    private final FileTaskProcessor fileTaskProcessor;
 
-
-    public FileWorker(BlockingQueue<WorkerTask> queue, FilesStat filesStat, FileIndex fileIndex, FileRecoveryCoordinator fileRecoveryCoordinator) {
+    public FileWorker(
+            BlockingQueue<WorkerTask> queue,
+            FilesStat filesStat,
+            FileIndex fileIndex,
+            FileRecoveryCoordinator fileRecoveryCoordinator,
+            FileTaskProcessor fileTaskProcessor
+    ) {
         this.queue = queue;
         this.filesStat = filesStat;
         this.fileIndex = fileIndex;
         this.fileRecoveryCoordinator = fileRecoveryCoordinator;
+        this.fileTaskProcessor = Objects.requireNonNull(
+                fileTaskProcessor,
+                "fileTaskProcessor must not be null"
+        );
+    }
+
+    public FileWorker(
+            BlockingQueue<WorkerTask> queue,
+            FilesStat filesStat,
+            FileIndex fileIndex,
+            FileRecoveryCoordinator fileRecoveryCoordinator
+    ) {
+        this(
+                queue,
+                filesStat,
+                fileIndex,
+                fileRecoveryCoordinator,
+                FileProcessor::process
+        );
     }
 
     @Override
@@ -57,7 +84,7 @@ public class FileWorker implements Runnable {
                 }
 
                 if (fileTask.changeType() == ChangeType.CREATED || fileTask.changeType() == ChangeType.MODIFIED) {
-                    FileInfo newFile = FileProcessor.process(fileTask);
+                    FileInfo newFile = fileTaskProcessor.process(fileTask);
                     FileInfo oldFile = fileIndex.addToMap(newFile);
                     if (oldFile == null) {
                         filesStat.getCountFiles().incrementAndGet();
@@ -69,6 +96,9 @@ public class FileWorker implements Runnable {
                 }
 
                 fileRecoveryCoordinator.onSuccess(fileTask.path());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
             } catch (NoSuchFileException e) {
                 deleteIndexInMap(
                         fileIndex,

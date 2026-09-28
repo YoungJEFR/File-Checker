@@ -25,5 +25,17 @@ public class FilesStat {
     public AtomicInteger getErrorFiles() {
         return errorFiles;
     }
+
+    public long getLongCountByteFiles() {
+        return countByteFiles.longValue();
+    }
+
+    public int getIntCountFiles() {
+        return countFiles.intValue();
+    }
+
+    public int getIntErrorFiles() {
+        return errorFiles.intValue();
+    }
 }
 

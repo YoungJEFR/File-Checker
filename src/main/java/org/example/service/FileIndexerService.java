@@ -5,6 +5,8 @@ import org.example.model.*;
 import org.example.pipeline.FileProducer;
 import org.example.pipeline.FileWorker;
 import org.example.processor.FileIndex;
+import org.example.processor.FileProcessor;
+import org.example.processor.FileTaskProcessor;
 import org.example.reconciliation.DirectoryReconciler;
 import org.example.reconciliation.DirectoryReconciliationService;
 import org.example.reconciliation.DirectoryRecoveryHandler;
@@ -25,7 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 
 
-public class FileIndexerService {
+public class FileIndexerService implements AutoCloseable {
     private final Path root;
     private final List<BlockingQueue<WorkerTask>> queues;
     private final FilesStat filesStat;
@@ -49,14 +51,16 @@ public class FileIndexerService {
     private FileIndexerState indexerState = FileIndexerState.NEW;
     private final Object lifecycleLock = new Object();
 
-    public FileIndexerService(
+    FileIndexerService(
             int workerCount,
             Path root,
-            int maxRecoveryAttempts
+            int maxRecoveryAttempts,
+            int queueCapacity,
+            FileTaskProcessor processor
     ) {
         this.root = root;
 
-        queues = createQueues(workerCount);
+        queues = createQueues(workerCount, queueCapacity);
 
         filesStat = new FilesStat(
                 new AtomicInteger(),
@@ -123,7 +127,7 @@ public class FileIndexerService {
 
 
         workers = new Thread[queues.size()];
-        createWorkers();
+        createWorkers(processor);
 
         WatchRegistrar watchRegistrar =
                 new WatchRegistrar(
@@ -156,13 +160,29 @@ public class FileIndexerService {
 
     }
 
-    private void createWorkers() {
+    public FileIndexerService(
+            int workerCount,
+            Path root,
+            int maxRecoveryAttempts
+    ) {
+        this(
+                workerCount,
+                root,
+                maxRecoveryAttempts,
+                QUEUE_CAPACITY,
+                FileProcessor::process
+        );
+    }
+
+
+    private void createWorkers(FileTaskProcessor processor) {
         for (int i = 0; i < workers.length; i++) {
             FileWorker fileWorker = new FileWorker(
                     queues.get(i),
                     filesStat,
                     fileIndex,
-                    fileRecoveryCoordinator
+                    fileRecoveryCoordinator,
+                    processor
             );
 
             workers[i] = new Thread(
@@ -219,14 +239,15 @@ public class FileIndexerService {
     }
 
     private static List<BlockingQueue<WorkerTask>> createQueues(
-            int workerCount
+            int workerCount,
+            int queueCapacity
     ) {
         List<BlockingQueue<WorkerTask>> queues =
                 new ArrayList<>(workerCount);
 
         for (int i = 0; i < workerCount; i++) {
             queues.add(
-                    new ArrayBlockingQueue<>(QUEUE_CAPACITY)
+                    new ArrayBlockingQueue<>(queueCapacity)
             );
         }
 
@@ -458,6 +479,19 @@ public class FileIndexerService {
         if (wasInterrupted) {
             throw new InterruptedException();
         }
+    }
 
+    @Override
+    public void close() {
+        shutdown();
+    }
+
+    public FileIndexerSnapshot snapshot() {
+        return new FileIndexerSnapshot(
+                fileIndex.snapshotMap(),
+                filesStat.getIntCountFiles(),
+                filesStat.getLongCountByteFiles(),
+                filesStat.getIntErrorFiles()
+        );
     }
 }

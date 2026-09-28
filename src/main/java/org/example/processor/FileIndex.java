@@ -3,6 +3,7 @@ package org.example.processor;
 import org.example.model.FileInfo;
 
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -19,6 +20,10 @@ public class FileIndex {
 
     public Set<Path> snapshotPaths() {
         return Set.copyOf(indexMap.keySet());
+    }
+
+    public Map<Path, FileInfo> snapshotMap() {
+        return Map.copyOf(indexMap);
     }
 
     public FileInfo addToMap(FileInfo fileInfo) {
