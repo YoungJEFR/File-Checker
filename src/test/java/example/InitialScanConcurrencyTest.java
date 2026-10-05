@@ -75,14 +75,9 @@ class InitialScanConcurrencyTest {
                 ),
                 watchedChanges
         );
-        ConcurrentHashMap<Path, FileInfo> indexMap =
-                new ConcurrentHashMap<>();
-        FileIndex fileIndex = new FileIndex(indexMap);
-        FilesStat filesStat = new FilesStat(
-                new AtomicInteger(),
-                new AtomicInteger(),
-                new LongAdder()
-        );
+        FileIndex fileIndex = new FileIndex();
+        FilesStat filesStat = new FilesStat();
+        Object indexStateLock = new Object();
         ScheduledExecutorService recoveryExecutor =
                 Executors.newSingleThreadScheduledExecutor();
         ScheduledExecutorService debounceExecutor =
@@ -101,7 +96,8 @@ class InitialScanConcurrencyTest {
                         queue,
                         filesStat,
                         fileIndex,
-                        recoveryCoordinator
+                        recoveryCoordinator,
+                        indexStateLock
                 ),
                 "InitialScanWorkerTest"
         );
@@ -181,8 +177,8 @@ class InitialScanConcurrencyTest {
 
             Set<Path> diskPaths = scanMarkdownPaths(tempDir);
             assertEquals(diskPaths, fileIndex.snapshotPaths());
-            assertEquals(diskPaths.size(), filesStat.getCountFiles().get());
-            assertEquals(totalBytes(diskPaths), filesStat.getCountByteFiles().sum());
+            assertEquals(diskPaths.size(), filesStat.countFiles());
+            assertEquals(totalBytes(diskPaths), filesStat.totalBytes());
         } finally {
             allowScan.countDown();
             producerThread.interrupt();

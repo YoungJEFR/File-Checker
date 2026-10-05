@@ -1,12 +1,14 @@
 package example;
 
 import org.example.filescanner.FileScanner;
+import org.example.model.FileIndexerSnapshot;
 import org.example.model.FileTask;
 import org.example.model.WorkerTask;
 import org.example.processor.FileIndex;
 import org.example.reconciliation.DirectoryReconciler;
 import org.example.reconciliation.DirectoryReconciliationService;
 import org.example.route.TaskRouter;
+import org.example.service.FileIndexerService;
 import org.example.watcher.FileChangeDebounce;
 import org.example.watcher.FileWatcher;
 import org.example.watcher.WatchRegistrar;
@@ -14,23 +16,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
+import java.util.concurrent.*;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 class FileWatcherTest {
 
@@ -157,6 +151,137 @@ class FileWatcherTest {
         );
     }
 
+    @Test
+    void movingDirectoryOutsideRootShouldRemoveItsFilesFromIndex()
+            throws IOException, InterruptedException {
+        Path watchedDirectory =
+                Files.createDirectory(tempDir.resolve("watched"));
+
+        Path nestedDirectory =
+                Files.createDirectory(watchedDirectory.resolve("nested"));
+
+        Path outsideDirectory = Files.createDirectory(
+                tempDir.resolve("outside")
+        );
+
+        Path files1 = Files.write(
+                nestedDirectory.resolve("file1.md"),
+                new byte[10]
+        );
+
+        Path files2 = Files.write(
+                nestedDirectory.resolve("file2.md"),
+                new byte[20]
+        );
+
+
+        try (FileIndexerService service = new FileIndexerService(
+                3,
+                watchedDirectory,
+                3)) {
+
+            service.start();
+
+            FileIndexerSnapshot snapshotMap = service.snapshot();
+
+            assertEquals(2, snapshotMap.countFiles());
+            assertEquals(30, snapshotMap.totalBytes());
+            assertEquals(0, snapshotMap.errorCount());
+            assertEquals(
+                    Set.of(files1, files2),
+                    snapshotMap.files().keySet()
+            );
+
+            Files.move(
+                    nestedDirectory,
+                    outsideDirectory.resolve(nestedDirectory.getFileName())
+            );
+
+            FileIndexerSnapshot newSnapshotMap = service.snapshot();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+
+            while (System.nanoTime() < deadline
+                    && !(newSnapshotMap.files().isEmpty()
+                    && newSnapshotMap.countFiles() == 0
+                    && newSnapshotMap.totalBytes() == 0)){
+                Thread.sleep(20);
+                newSnapshotMap = service.snapshot();
+            }
+
+            assertTrue(newSnapshotMap.files().isEmpty());
+
+            assertEquals(0, newSnapshotMap.countFiles());
+            assertEquals(0, newSnapshotMap.totalBytes());
+            assertEquals(0, newSnapshotMap.errorCount());
+
+        }
+
+    }
+
+    @Test
+    void deletingDirectoryTreeShouldRemoveItsFilesFromIndex()
+    throws IOException, InterruptedException {
+        Path watchedDirectory =
+                Files.createDirectory(tempDir.resolve("watched"));
+
+        Path nestedDirectory =
+                Files.createDirectory(watchedDirectory.resolve("nested"));
+
+
+        Path files1 = Files.write(
+                nestedDirectory.resolve("file1.md"),
+                new byte[10]
+        );
+
+        Path files2 = Files.write(
+                nestedDirectory.resolve("file2.md"),
+                new byte[20]
+        );
+
+
+        try (FileIndexerService service = new FileIndexerService(
+                3,
+                watchedDirectory,
+                3)) {
+
+            service.start();
+
+            FileIndexerSnapshot snapshotMap = service.snapshot();
+
+            assertEquals(2, snapshotMap.countFiles());
+            assertEquals(30, snapshotMap.totalBytes());
+            assertEquals(0, snapshotMap.errorCount());
+            assertEquals(
+                    Set.of(files1, files2),
+                    snapshotMap.files().keySet()
+            );
+
+            Files.delete(files1);
+            Files.delete(files2);
+            Files.delete(nestedDirectory);
+
+            FileIndexerSnapshot newSnapshotMap = service.snapshot();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+
+            while (System.nanoTime() < deadline
+                    && !(newSnapshotMap.files().isEmpty()
+                    && newSnapshotMap.countFiles() == 0
+                    && newSnapshotMap.totalBytes() == 0)){
+                Thread.sleep(20);
+                newSnapshotMap = service.snapshot();
+            }
+
+            assertTrue(newSnapshotMap.files().isEmpty());
+
+            assertEquals(0, newSnapshotMap.countFiles());
+            assertEquals(0, newSnapshotMap.totalBytes());
+            assertEquals(0, newSnapshotMap.errorCount());
+
+        }
+    }
+
+
+
     private void startWatcher() throws InterruptedException {
         startWatcher(tempDir);
     }
@@ -181,7 +306,7 @@ class FileWatcherTest {
         DirectoryReconciler directoryReconciler =
                 new DirectoryReconciler(
                         new FileScanner(),
-                        new FileIndex(new ConcurrentHashMap<>()),
+                        new FileIndex(),
                         router
                 );
 

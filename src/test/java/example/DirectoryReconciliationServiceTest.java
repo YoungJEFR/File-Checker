@@ -12,17 +12,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -235,6 +230,28 @@ class DirectoryReconciliationServiceTest {
         }
     }
 
+    @Test
+    void uncheckedIOExceptionShouldNotPreventLaterRequest()
+            throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        DirectoryReconciliationService service = service(directory -> {
+            int call = calls.incrementAndGet();
+            if (call == 1) {
+                throw new UncheckedIOException(
+                        new IOException("Ошибка обхода для теста")
+                );
+            }
+        });
+
+        service.request(tempDir);
+        awaitExecutor();
+        assertEquals(1, calls.get());
+
+        service.request(tempDir);
+        awaitExecutor();
+        assertEquals(2, calls.get());
+    }
+
     private DirectoryReconciliationService service(
             ReconciliationAction action
     ) {
@@ -262,7 +279,7 @@ class DirectoryReconciliationServiceTest {
         private ControlledDirectoryReconciler(ReconciliationAction action) {
             super(
                     new FileScanner(),
-                    new FileIndex(new ConcurrentHashMap<>()),
+                    new FileIndex(),
                     new TaskRouter(List.of(
                             new ArrayBlockingQueue<WorkerTask>(1)
                     ))

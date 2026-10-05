@@ -46,7 +46,7 @@ class DirectoryRecoveryHandlerTest {
         TaskRouter router = new TaskRouter(List.of(queue));
         DirectoryReconciler reconciler = new DirectoryReconciler(
                 new FileScanner(),
-                new FileIndex(new ConcurrentHashMap<>()),
+                new FileIndex(),
                 router
         );
         DirectoryReconciliationService reconciliationService =

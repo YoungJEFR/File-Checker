@@ -19,7 +19,7 @@ public final class WatchRegistrar {
             WatchService watchService
     ) throws IOException {
 
-        try (Stream<Path> paths = Files.walk(root)) {
+        try (Stream<Path> paths = Files.walk(root   )) {
             Iterator<Path> directories = paths
                     .filter(Files::isDirectory)
                     .iterator();

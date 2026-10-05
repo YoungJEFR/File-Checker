@@ -1,6 +1,7 @@
 package org.example.reconciliation;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -70,6 +71,8 @@ public class DirectoryReconciliationService {
                 reconciliationStatusMap.remove(directory);
                 return;
             } catch (IOException e) {
+                e.printStackTrace();
+            } catch (UncheckedIOException e) {
                 e.printStackTrace();
             }
 

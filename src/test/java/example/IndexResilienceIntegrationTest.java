@@ -24,12 +24,9 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -58,12 +55,13 @@ class IndexResilienceIntegrationTest {
         );
         Path indexOnlyFile = tempDir.resolve("index-only.md");
 
-        ConcurrentHashMap<Path, FileInfo> indexMap =
-                new ConcurrentHashMap<>();
-        FileIndex fileIndex = new FileIndex(indexMap);
+        FileIndex fileIndex = new FileIndex();
         fileIndex.addToMap(fileInfo(changedFile, 10));
         fileIndex.addToMap(fileInfo(indexOnlyFile, 30));
-        FilesStat filesStat = filesStat(2, 40);
+        FilesStat filesStat = new FilesStat();
+        Object indexStateLock = new Object();
+        filesStat.fileAdded(10);
+        filesStat.fileAdded(30);
 
         BlockingQueue<WorkerTask> queue = new ArrayBlockingQueue<>(20);
         TaskRouter router = new TaskRouter(List.of(queue));
@@ -76,7 +74,8 @@ class IndexResilienceIntegrationTest {
                         queue,
                         filesStat,
                         fileIndex,
-                        recoveryCoordinator
+                        recoveryCoordinator,
+                        indexStateLock
                 ),
                 "ReconciliationWorkerTest"
         );
@@ -100,9 +99,9 @@ class IndexResilienceIntegrationTest {
             assertEquals(diskPaths, fileIndex.snapshotPaths());
             assertEquals(40, fileIndex.getFileInfo(changedFile).fileSize());
             assertEquals(25, fileIndex.getFileInfo(diskOnlyFile).fileSize());
-            assertEquals(diskPaths.size(), filesStat.getCountFiles().get());
-            assertEquals(diskBytes, filesStat.getCountByteFiles().sum());
-            assertEquals(0, filesStat.getErrorFiles().get());
+            assertEquals(diskPaths.size(), filesStat.countFiles());
+            assertEquals(diskBytes, filesStat.totalBytes());
+            assertEquals(0, filesStat.countError());
         } finally {
             worker.interrupt();
             worker.join(2_000);
@@ -119,10 +118,9 @@ class IndexResilienceIntegrationTest {
             queues.add(new ArrayBlockingQueue<>(32));
         }
 
-        ConcurrentHashMap<Path, FileInfo> indexMap =
-                new ConcurrentHashMap<>();
-        FileIndex fileIndex = new FileIndex(indexMap);
-        FilesStat filesStat = filesStat(0, 0);
+        FileIndex fileIndex = new FileIndex();
+        FilesStat filesStat = new FilesStat();
+        Object indexStateLock = new Object();
         TaskRouter router = new TaskRouter(queues);
         ScheduledExecutorService recoveryScheduler =
                 Executors.newSingleThreadScheduledExecutor();
@@ -136,7 +134,8 @@ class IndexResilienceIntegrationTest {
                             queues.get(i),
                             filesStat,
                             fileIndex,
-                            recoveryCoordinator
+                            recoveryCoordinator,
+                            indexStateLock
                     ),
                     "StressWorker-" + i
             );
@@ -173,13 +172,16 @@ class IndexResilienceIntegrationTest {
                 );
             }
 
-            assertEquals(STRESS_FILE_COUNT, indexMap.size());
             assertEquals(
                     STRESS_FILE_COUNT,
-                    filesStat.getCountFiles().get()
+                    fileIndex.snapshotMap().size()
             );
-            assertEquals(expectedBytes, filesStat.getCountByteFiles().sum());
-            assertEquals(0, filesStat.getErrorFiles().get());
+            assertEquals(
+                    STRESS_FILE_COUNT,
+                    filesStat.countFiles()
+            );
+            assertEquals(expectedBytes, filesStat.totalBytes());
+            assertEquals(0, filesStat.countError());
         } finally {
             for (Thread worker : workers) {
                 worker.interrupt();
@@ -200,16 +202,6 @@ class IndexResilienceIntegrationTest {
                 3,
                 (failedTask, cause) -> {
                 }
-        );
-    }
-
-    private FilesStat filesStat(int fileCount, long byteCount) {
-        LongAdder bytes = new LongAdder();
-        bytes.add(byteCount);
-        return new FilesStat(
-                new AtomicInteger(fileCount),
-                new AtomicInteger(),
-                bytes
         );
     }
 

@@ -216,7 +216,7 @@ class FileRecoveryCoordinatorTest {
         try {
             DirectoryReconciler reconciler = new DirectoryReconciler(
                     new FileScanner(),
-                    new FileIndex(new ConcurrentHashMap<>()),
+                    new FileIndex(),
                     router
             );
             DirectoryReconciliationService reconciliationService =

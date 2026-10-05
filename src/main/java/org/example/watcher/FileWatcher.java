@@ -43,7 +43,10 @@ public class FileWatcher implements Runnable {
 
             while (true) {
                 WatchKey key = watcher.take();
-                Path directory = watchRegistrar.directoryFor(key);
+                Path directory = watchRegistrar
+                        .directoryFor(key)
+                        .toAbsolutePath()
+                        .normalize();
 
                 if (directory == null) {
                     key.reset();
@@ -66,10 +69,14 @@ public class FileWatcher implements Runnable {
                         watchRegistrar.registerRecursively(fullPath, watcher);
                         requestRescan(fullPath);
                         continue;
+                    } else if (kind == StandardWatchEventKinds.ENTRY_DELETE) {
+                        reconciliationService.request(directory);
                     }
+
+
                     if (fullPath.toString().endsWith(".md")) {
                         if (kind == StandardWatchEventKinds.ENTRY_MODIFY) {
-                            debounce.debounceOnModify(new FileTask(fullPath, ChangeType.MODIFIED));
+                            handleModify(fullPath);
                             continue;
                         }
 
@@ -104,6 +111,13 @@ public class FileWatcher implements Runnable {
 
     private void requestRescan(Path path) {
         reconciliationService.request(path);
+    }
+
+    void handleModify(Path fullPath) {
+        if (!fullPath.toString().endsWith(".md") || Files.isDirectory(fullPath)) {
+            return;
+        }
+        debounce.debounceOnModify(new FileTask(fullPath, ChangeType.MODIFIED));
     }
 
     void handleOverflow(Path directory) {

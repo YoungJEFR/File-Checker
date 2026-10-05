@@ -27,19 +27,14 @@ class FileWorkerTest {
     @TempDir
     Path tempDir;
 
-    private ConcurrentHashMap<Path, FileInfo> indexMap;
     private FilesStat filesStat;
     private FileIndex fileIndex;
+    private final Object indexStateLock = new Object();
 
     @BeforeEach
     void setUp() {
-        indexMap = new ConcurrentHashMap<>();
-        filesStat = new FilesStat(
-                new AtomicInteger(),
-                new AtomicInteger(),
-                new LongAdder()
-        );
-        fileIndex = new FileIndex(indexMap);
+        filesStat = new FilesStat();
+        fileIndex = new FileIndex();
     }
 
     @Test
@@ -74,7 +69,8 @@ class FileWorkerTest {
                 filesStat,
                 fileIndex,
                 recoveryCoordinator,
-                processor
+                processor,
+                indexStateLock
         );
         Thread workerThread = new Thread(
                 fileWorker,
@@ -107,8 +103,8 @@ class FileWorkerTest {
                     "Worker не завершился после StopTask"
             );
             assertNotNull(fileIndex.getFileInfo(file));
-            assertEquals(1, filesStat.getCountFiles().get());
-            assertEquals(10, filesStat.getCountByteFiles().sum());
+            assertEquals(1, filesStat.countFiles());
+            assertEquals(10, filesStat.totalBytes());
         } finally {
             allowWorker.countDown();
             queue.offer(new StopTask());
@@ -159,7 +155,8 @@ class FileWorkerTest {
                         filesStat,
                         fileIndex,
                         recoveryCoordinator,
-                        processor
+                        processor,
+                        indexStateLock
                 ),
                 "FullQueueFileWorkerTest"
         );
@@ -230,8 +227,8 @@ class FileWorkerTest {
             );
             assertNotNull(fileIndex.getFileInfo(firstFile));
             assertNotNull(fileIndex.getFileInfo(secondFile));
-            assertEquals(2, filesStat.getCountFiles().get());
-            assertEquals(30, filesStat.getCountByteFiles().sum());
+            assertEquals(2, filesStat.countFiles());
+            assertEquals(30, filesStat.totalBytes());
             assertTrue(queue.isEmpty());
         } finally {
             allowWorker.countDown();
@@ -257,10 +254,10 @@ class FileWorkerTest {
                 new FileTask(file, ChangeType.CREATED)
         );
 
-        assertEquals(1, indexMap.size());
-        assertEquals(1, filesStat.getCountFiles().get());
-        assertEquals(100, filesStat.getCountByteFiles().sum());
-        assertEquals(0, filesStat.getErrorFiles().get());
+        assertEquals(1, fileIndex.snapshotMap().size());
+        assertEquals(1, filesStat.countFiles());
+        assertEquals(100, filesStat.totalBytes());
+        assertEquals(0, filesStat.countError());
     }
 
     @Test
@@ -280,11 +277,11 @@ class FileWorkerTest {
                 new FileTask(file, ChangeType.CREATED)
         );
 
-        assertEquals(1, indexMap.size());
-        assertEquals(1, filesStat.getCountFiles().get());
-        assertEquals(150, filesStat.getCountByteFiles().sum());
-        assertEquals(150, indexMap.get(file).fileSize());
-        assertEquals(0, filesStat.getErrorFiles().get());
+        assertEquals(1, fileIndex.snapshotMap().size());
+        assertEquals(1, filesStat.countFiles());
+        assertEquals(150, filesStat.totalBytes());
+        assertEquals(150, fileIndex.getFileInfo(file).fileSize());
+        assertEquals(0, filesStat.countError());
     }
 
     @Test
@@ -303,10 +300,10 @@ class FileWorkerTest {
                 new FileTask(file, ChangeType.DELETED)
         );
 
-        assertEquals(0, indexMap.size());
-        assertEquals(0, filesStat.getCountFiles().get());
-        assertEquals(0, filesStat.getCountByteFiles().sum());
-        assertEquals(0, filesStat.getErrorFiles().get());
+        assertEquals(0, fileIndex.snapshotMap().size());
+        assertEquals(0, filesStat.countFiles());
+        assertEquals(0, filesStat.totalBytes());
+        assertEquals(0, filesStat.countError());
     }
 
     @Test
@@ -320,11 +317,11 @@ class FileWorkerTest {
                 new FileTask(nextFile, ChangeType.CREATED)
         );
 
-        assertEquals(1, indexMap.size());
-        assertEquals(50, indexMap.get(nextFile).fileSize());
-        assertEquals(1, filesStat.getCountFiles().get());
-        assertEquals(50, filesStat.getCountByteFiles().sum());
-        assertEquals(0, filesStat.getErrorFiles().get());
+        assertEquals(1, fileIndex.snapshotMap().size());
+        assertEquals(50, fileIndex.getFileInfo(nextFile).fileSize());
+        assertEquals(1, filesStat.countFiles());
+        assertEquals(50, filesStat.totalBytes());
+        assertEquals(0, filesStat.countError());
     }
 
     @Test
@@ -336,11 +333,11 @@ class FileWorkerTest {
                 new FileTask(file, ChangeType.MODIFIED)
         );
 
-        assertEquals(1, indexMap.size());
-        assertEquals(80, indexMap.get(file).fileSize());
-        assertEquals(1, filesStat.getCountFiles().get());
-        assertEquals(80, filesStat.getCountByteFiles().sum());
-        assertEquals(0, filesStat.getErrorFiles().get());
+        assertEquals(1, fileIndex.snapshotMap().size());
+        assertEquals(80, fileIndex.getFileInfo(file).fileSize());
+        assertEquals(1, filesStat.countFiles());
+        assertEquals(80, filesStat.totalBytes());
+        assertEquals(0, filesStat.countError());
     }
 
     @Test
@@ -355,11 +352,11 @@ class FileWorkerTest {
                 new FileTask(nextFile, ChangeType.CREATED)
         );
 
-        assertEquals(1, indexMap.size());
-        assertEquals(50, indexMap.get(nextFile).fileSize());
-        assertEquals(1, filesStat.getCountFiles().get());
-        assertEquals(50, filesStat.getCountByteFiles().sum());
-        assertEquals(0, filesStat.getErrorFiles().get());
+        assertEquals(1, fileIndex.snapshotMap().size());
+        assertEquals(50, fileIndex.getFileInfo(nextFile).fileSize());
+        assertEquals(1, filesStat.countFiles());
+        assertEquals(50, filesStat.totalBytes());
+        assertEquals(0, filesStat.countError());
     }
 
     @Test
@@ -374,10 +371,10 @@ class FileWorkerTest {
 
         processTasks(new FileTask(file, ChangeType.MODIFIED));
 
-        assertEquals(0, indexMap.size());
-        assertEquals(0, filesStat.getCountFiles().get());
-        assertEquals(0, filesStat.getCountByteFiles().sum());
-        assertEquals(0, filesStat.getErrorFiles().get());
+        assertEquals(0, fileIndex.snapshotMap().size());
+        assertEquals(0, filesStat.countFiles());
+        assertEquals(0, filesStat.totalBytes());
+        assertEquals(0, filesStat.countError());
     }
 
     @Test
@@ -408,7 +405,8 @@ class FileWorkerTest {
                         queue,
                         filesStat,
                         fileIndex,
-                        recoveryCoordinator
+                        recoveryCoordinator,
+                        indexStateLock
                 ),
                 "BarrierWorkerTest"
         );
@@ -423,7 +421,7 @@ class FileWorkerTest {
                     barrierReached.await(2, TimeUnit.SECONDS),
                     "Worker не достиг BarrierTask"
             );
-            assertEquals(10, indexMap.get(firstFile).fileSize());
+            assertEquals(10, fileIndex.getFileInfo(firstFile).fileSize());
             assertTrue(
                     workerThread.isAlive(),
                     "BarrierTask ошибочно завершил worker"
@@ -434,9 +432,9 @@ class FileWorkerTest {
             workerThread.join(2_000);
 
             assertFalse(workerThread.isAlive());
-            assertEquals(20, indexMap.get(secondFile).fileSize());
-            assertEquals(2, filesStat.getCountFiles().get());
-            assertEquals(30, filesStat.getCountByteFiles().sum());
+            assertEquals(20, fileIndex.getFileInfo(secondFile).fileSize());
+            assertEquals(2, filesStat.countFiles());
+            assertEquals(30, filesStat.totalBytes());
         } finally {
             workerThread.interrupt();
             workerThread.join(2_000);
@@ -470,7 +468,8 @@ class FileWorkerTest {
                         queue,
                         filesStat,
                         fileIndex,
-                        recoveryCoordinator
+                        recoveryCoordinator,
+                        indexStateLock
                 ),
                 "FileWorkerTest"
         );

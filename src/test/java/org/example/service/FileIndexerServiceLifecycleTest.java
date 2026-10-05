@@ -1,8 +1,9 @@
 package org.example.service;
 
-import org.example.model.ChangeType;
-import org.example.model.FileTask;
-import org.example.model.WorkerTask;
+import org.example.filescanner.FileScanner;
+import org.example.model.*;
+import org.example.pipeline.FileWorker;
+import org.example.processor.FileIndex;
 import org.example.processor.FileProcessor;
 import org.example.processor.FileTaskProcessor;
 import org.junit.jupiter.api.RepeatedTest;
@@ -10,15 +11,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -30,6 +31,116 @@ class FileIndexerServiceLifecycleTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    @Timeout(10)
+    void snapshotShouldNotWaitForFileProcessing() throws Exception {
+        Path watched = Files.createDirectory(tempDir.resolve("watched"));
+        // Файл вне наблюдаемой папки: задачу подаём сами, без событий ОС.
+        Path file = Files.write(tempDir.resolve("file.md"), new byte[10])
+                .toAbsolutePath().normalize();
+        CountDownLatch processorEntered = new CountDownLatch(1);
+        CountDownLatch allowProcessing = new CountDownLatch(1);
+        CountDownLatch processingFinished = new CountDownLatch(1);
+
+        FileTaskProcessor processor = task -> {
+            processorEntered.countDown();
+            allowProcessing.await();
+            return FileProcessor.process(task);
+        };
+        FileIndexerService service = new FileIndexerService(
+                1, watched, 3, 10, processor
+        );
+        ExecutorService snapshotExecutor = Executors.newSingleThreadExecutor();
+
+        try {
+            service.start();
+            BlockingQueue<WorkerTask> queue = queuesOf(service).get(0);
+            queue.put(new FileTask(file, ChangeType.CREATED));
+            queue.put(new BarrierTask(processingFinished));
+            assertTrue(processorEntered.await(2, TimeUnit.SECONDS),
+                    "Worker не вошёл в процессор");
+
+            Future<FileIndexerSnapshot> future = snapshotExecutor.submit(service::snapshot);
+            // Если process() удерживает indexStateLock, get() завершится по таймауту.
+            FileIndexerSnapshot before = future.get(2, TimeUnit.SECONDS);
+
+            assertEquals(1L, allowProcessing.getCount(),
+                    "Snapshot должен вернуться до освобождения процессора");
+            assertTrue(before.files().isEmpty());
+            assertEquals(0, before.countFiles());
+            assertEquals(0, before.totalBytes());
+            assertEquals(0, before.errorCount());
+
+            allowProcessing.countDown();
+            assertTrue(processingFinished.await(2, TimeUnit.SECONDS),
+                    "Worker не дошёл до барьера после обработки файла");
+
+            FileIndexerSnapshot after = service.snapshot();
+            assertEquals(java.util.Set.of(file), after.files().keySet());
+            assertEquals(1, after.countFiles());
+            assertEquals(10, after.totalBytes());
+            assertEquals(0, after.errorCount());
+            assertTrue(before.files().isEmpty(), "Старый snapshot не должен изменяться");
+        } finally {
+            // Сначала освобождаем worker, иначе shutdown() будет ждать его.
+            allowProcessing.countDown();
+            service.shutdown();
+            snapshotExecutor.shutdownNow();
+            assertTrue(snapshotExecutor.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    @Timeout(10)
+    void initialScanIOExceptionShouldFailStartAndStopService() throws Exception {
+        assertInitialScanFailureStopsService(false);
+    }
+
+    @Test
+    @Timeout(10)
+    void initialScanUncheckedIOExceptionShouldFailStartAndStopService() throws Exception {
+        assertInitialScanFailureStopsService(true);
+    }
+
+    private void assertInitialScanFailureStopsService(boolean unchecked) throws Exception {
+        IOException expected = new IOException("Initial scan failed");
+        Path file = Files.write(tempDir.resolve("accepted.md"), new byte[10]);
+        AtomicBoolean scannerCalled = new AtomicBoolean();
+        FileScanner scanner = new FileScanner() {
+            @Override
+            public void scanFile(Path directory, FileHandler handler)
+                    throws IOException, InterruptedException {
+                scannerCalled.set(true);
+                // Ошибка возникает после передачи части файлов в очередь.
+                handler.handle(file);
+                if (unchecked) {
+                    throw new UncheckedIOException(expected);
+                }
+                throw expected;
+            }
+        };
+        FileIndexerService service = new FileIndexerService(
+                2, tempDir, 3, 100, FileProcessor::process, scanner
+        );
+        List<Thread> threads = ownedThreads(service);
+
+        try (service) {
+            IOException actual = assertThrows(IOException.class, service::start);
+
+            assertSame(expected, actual);
+            assertTrue(scannerCalled.get(), "Ошибка должна происходить в initial scan");
+            // Проверяем до close(): start() должен сам выполнить shutdown().
+            assertFullyStopped(service, threads);
+            for (String name : List.of(
+                    "debounceExecutor", "rescanExecutor", "recoveryExecutor")) {
+                Field field = FileIndexerService.class.getDeclaredField(name);
+                field.setAccessible(true);
+                ExecutorService executor = (ExecutorService) field.get(service);
+                assertTrue(executor.isTerminated(), name + " остался работать");
+            }
+        }
+    }
 
     @Test
     @Timeout(value = 10, unit = TimeUnit.SECONDS)
@@ -571,6 +682,73 @@ class FileIndexerServiceLifecycleTest {
             }
         }
 
+    }
+
+    @Test
+    @Timeout(10)
+    void snapshotShouldWaitUntilIndexAndStatisticsAreUpdatedTogether() throws Exception {
+        Path watched = Files.createDirectory(tempDir.resolve("watched"));
+        Path file = Files.write(tempDir.resolve("file.md"), new byte[10])
+                .toAbsolutePath().normalize();
+        CountDownLatch indexUpdate = new CountDownLatch(1);
+        CountDownLatch allowStatisticsUpdate = new CountDownLatch(1);
+        CountDownLatch snapshotStarted = new CountDownLatch(1);
+
+        FileIndex newFileIndex = new FileIndex() {
+            @Override
+            public FileInfo addToMap(FileInfo fileInfo){
+                FileInfo info = super.addToMap(fileInfo);
+                indexUpdate.countDown();
+                try {
+                    allowStatisticsUpdate.await();
+                }catch (InterruptedException e){
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Тестовое ожидание прервано", e);
+                }
+                return info;
+            }
+        };
+
+        FileIndexerService service = new FileIndexerService(
+                1, watched, 3, 10, FileProcessor::process,
+                new FileScanner(), newFileIndex
+        );
+        ExecutorService snapshotExecutor = Executors.newSingleThreadExecutor();
+
+        try {
+            service.start();
+            queuesOf(service).get(0).put(new FileTask(file, ChangeType.CREATED));
+            assertTrue(indexUpdate.await(2, TimeUnit.SECONDS),
+                    "Worker не добавил файл в индекс");
+            assertNotNull(newFileIndex.getFileInfo(file));
+
+            Future<FileIndexerSnapshot> snapshotFuture = snapshotExecutor.submit(() -> {
+                snapshotStarted.countDown();
+                return service.snapshot();
+            });
+            assertTrue(snapshotStarted.await(2, TimeUnit.SECONDS),
+                    "Поток snapshot не начал выполнение");
+
+            assertThrows(TimeoutException.class,
+                    () -> snapshotFuture.get(200, TimeUnit.MILLISECONDS),
+                    "Snapshot вернулся посередине обновления индекса и статистики");
+
+            allowStatisticsUpdate.countDown();
+            FileIndexerSnapshot snapshot = snapshotFuture.get(2, TimeUnit.SECONDS);
+
+            assertEquals(java.util.Set.of(file), snapshot.files().keySet());
+            assertEquals(1, snapshot.countFiles());
+            assertEquals(10, snapshot.totalBytes());
+            assertEquals(0, snapshot.errorCount());
+            assertEquals(snapshot.files().size(), snapshot.countFiles());
+            assertEquals(snapshot.files().values().stream()
+                    .mapToLong(FileInfo::fileSize).sum(), snapshot.totalBytes());
+        } finally {
+            allowStatisticsUpdate.countDown();
+            service.shutdown();
+            snapshotExecutor.shutdownNow();
+            assertTrue(snapshotExecutor.awaitTermination(2, TimeUnit.SECONDS));
+        }
     }
 
     @SuppressWarnings("unchecked")

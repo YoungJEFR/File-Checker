@@ -23,15 +23,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.LongAdder;
 
 
 public class FileIndexerService implements AutoCloseable {
     private final Path root;
     private final List<BlockingQueue<WorkerTask>> queues;
     private final FilesStat filesStat;
-    private final ConcurrentHashMap<Path, FileInfo> indexMap;
     private final FileIndex fileIndex;
     private final TaskRouter taskRouter;
     private final FileScanner fileScanner;
@@ -47,6 +44,8 @@ public class FileIndexerService implements AutoCloseable {
     private final CountDownLatch watcherReady;
     private final FileWatcher fileWatcher;
     private final Thread producerThread;
+    private final FileProducer producer;
+    private final Object indexStateLock = new Object();
 
     private FileIndexerState indexerState = FileIndexerState.NEW;
     private final Object lifecycleLock = new Object();
@@ -58,22 +57,40 @@ public class FileIndexerService implements AutoCloseable {
             int queueCapacity,
             FileTaskProcessor processor
     ) {
-        this.root = root;
+        this(workerCount, root, maxRecoveryAttempts, queueCapacity,
+                processor, new FileScanner());
+    }
+
+    FileIndexerService(
+            int workerCount,
+            Path root,
+            int maxRecoveryAttempts,
+            int queueCapacity,
+            FileTaskProcessor processor,
+            FileScanner scanner
+    ) {
+        this(workerCount, root, maxRecoveryAttempts, queueCapacity,
+                processor, scanner, new FileIndex());
+    }
+
+    FileIndexerService(
+            int workerCount,
+            Path root,
+            int maxRecoveryAttempts,
+            int queueCapacity,
+            FileTaskProcessor processor,
+            FileScanner scanner,
+            FileIndex index
+    ) {
+        this.root = root.toAbsolutePath().normalize();
 
         queues = createQueues(workerCount, queueCapacity);
 
-        filesStat = new FilesStat(
-                new AtomicInteger(),
-                new AtomicInteger(),
-                new LongAdder()
-        );
+        filesStat = new FilesStat();
 
-        indexMap =
-                new ConcurrentHashMap<>();
-
-        fileIndex = new FileIndex(indexMap);
+        fileIndex = java.util.Objects.requireNonNull(index, "index");
         taskRouter = new TaskRouter(queues);
-        fileScanner = new FileScanner();
+        fileScanner = java.util.Objects.requireNonNull(scanner, "scanner");
 
         debounceExecutor =
                 Executors.newSingleThreadScheduledExecutor(runnable ->
@@ -138,7 +155,7 @@ public class FileIndexerService implements AutoCloseable {
         watcherReady = new CountDownLatch(1);
 
         fileWatcher = new FileWatcher(
-                root,
+                this.root,
                 debounce,
                 taskRouter,
                 watchRegistrar,
@@ -149,14 +166,15 @@ public class FileIndexerService implements AutoCloseable {
         watcherThread =
                 new Thread(fileWatcher, "FileWatcher");
 
-        FileProducer producer = new FileProducer(
-                root,
+        this.producer = new FileProducer(
+                this.root,
                 taskRouter,
                 fileScanner
         );
 
         producerThread =
-                new Thread(producer, "Producer");
+                new Thread(this.producer, "Producer");
+
 
     }
 
@@ -182,7 +200,8 @@ public class FileIndexerService implements AutoCloseable {
                     filesStat,
                     fileIndex,
                     fileRecoveryCoordinator,
-                    processor
+                    processor,
+                    indexStateLock
             );
 
             workers[i] = new Thread(
@@ -254,7 +273,7 @@ public class FileIndexerService implements AutoCloseable {
         return queues;
     }
 
-    private void runInitialScan() throws InterruptedException {
+    private void runInitialScan() throws InterruptedException, IOException {
         synchronized (lifecycleLock) {
             if (indexerState != FileIndexerState.STARTING) {
                 return;
@@ -263,6 +282,11 @@ public class FileIndexerService implements AutoCloseable {
         }
 
         producerThread.join();
+        IOException failure = producer.getScanFailure();
+        if (failure != null) {
+            throw failure;
+        }
+
     }
 
     private void awaitInitialProcessing()
@@ -314,6 +338,8 @@ public class FileIndexerService implements AutoCloseable {
                     wasInterrupted = true;
                 }
             }
+
+
         }
 
         if (wasInterrupted) {
@@ -487,11 +513,13 @@ public class FileIndexerService implements AutoCloseable {
     }
 
     public FileIndexerSnapshot snapshot() {
-        return new FileIndexerSnapshot(
-                fileIndex.snapshotMap(),
-                filesStat.getIntCountFiles(),
-                filesStat.getLongCountByteFiles(),
-                filesStat.getIntErrorFiles()
-        );
+        synchronized (indexStateLock) {
+            return new FileIndexerSnapshot(
+                    fileIndex.snapshotMap(),
+                    filesStat.countFiles(),
+                    filesStat.totalBytes(),
+                    filesStat.countError()
+            );
+        }
     }
 }

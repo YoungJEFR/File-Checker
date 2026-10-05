@@ -8,33 +8,39 @@ public class FilesStat {
     private final AtomicInteger countFiles;
     private final AtomicInteger errorFiles;
 
-    public FilesStat(AtomicInteger countFiles, AtomicInteger errorFiles, LongAdder countByteFiles) {
-        this.countByteFiles = countByteFiles;
-        this.countFiles = countFiles;
-        this.errorFiles = errorFiles;
+    public FilesStat() {
+        countByteFiles = new LongAdder();
+        countFiles = new AtomicInteger(0);
+        errorFiles = new AtomicInteger(0);
     }
 
-    public LongAdder getCountByteFiles() {
-        return countByteFiles;
+    public void fileAdded(long fileSize) {
+        countFiles.incrementAndGet();
+        countByteFiles.add(fileSize);
     }
 
-    public AtomicInteger getCountFiles() {
-        return countFiles;
+    public void fileSizeChanged(long difference) {
+        countByteFiles.add(difference);
     }
 
-    public AtomicInteger getErrorFiles() {
-        return errorFiles;
+    public void fileRemoved(long fileSize) {
+        countFiles.decrementAndGet();
+        countByteFiles.add(-fileSize);
     }
 
-    public long getLongCountByteFiles() {
+    public void recordError() {
+        errorFiles.incrementAndGet();
+    }
+
+    public long totalBytes() {
         return countByteFiles.longValue();
     }
 
-    public int getIntCountFiles() {
+    public int countFiles() {
         return countFiles.intValue();
     }
 
-    public int getIntErrorFiles() {
+    public int countError() {
         return errorFiles.intValue();
     }
 }

@@ -20,7 +20,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -49,9 +48,7 @@ class DirectoryReconcilerTest {
         Path indexOnlyPath = directory.resolve("index-only.md");
         Path outsidePath = tempDir.resolve("outside.md");
 
-        ConcurrentHashMap<Path, FileInfo> indexMap =
-                new ConcurrentHashMap<>();
-        FileIndex fileIndex = new FileIndex(indexMap);
+        FileIndex fileIndex = new FileIndex();
         fileIndex.addToMap(fileInfo(commonPath));
         fileIndex.addToMap(fileInfo(indexOnlyPath));
         fileIndex.addToMap(fileInfo(outsidePath));

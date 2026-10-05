@@ -6,12 +6,15 @@ import org.example.model.FileTask;
 import org.example.route.TaskRouter;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Path;
 
 public class FileProducer implements Runnable{
     private final Path path;
     private final TaskRouter taskRouter;
     private final FileScanner scanner;
+    private IOException scanFailure;
+
 
     public FileProducer(Path path, TaskRouter taskRouter, FileScanner scanner) {
         this.path = path;
@@ -33,7 +36,13 @@ public class FileProducer implements Runnable{
             return;
         } catch (IOException e){
             e.printStackTrace();
+            scanFailure = e;
+        } catch (UncheckedIOException e){
+            scanFailure = e.getCause();
         }
+    }
 
+    public IOException getScanFailure() {
+        return scanFailure;
     }
 }

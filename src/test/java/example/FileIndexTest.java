@@ -8,7 +8,6 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -17,7 +16,7 @@ class FileIndexTest {
 
     @Test
     void snapshotPathsShouldNotChangeWithIndex() {
-        FileIndex fileIndex = new FileIndex(new ConcurrentHashMap<>());
+        FileIndex fileIndex = new FileIndex();
         Path firstPath = Path.of("a.md");
         Path secondPath = Path.of("b.md");
 
@@ -38,7 +37,7 @@ class FileIndexTest {
     @Test
     void snapshotMapShouldBeImmutableAndDetachedFromIndex() {
         FileIndex fileIndex =
-                new FileIndex(new ConcurrentHashMap<>());
+                new FileIndex();
 
         Path firstPath = Path.of("a.md");
         Path secondPath = Path.of("b.md");

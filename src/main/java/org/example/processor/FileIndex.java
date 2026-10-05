@@ -10,8 +10,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public class FileIndex {
     private final ConcurrentHashMap<Path, FileInfo> indexMap;
 
-    public FileIndex(ConcurrentHashMap<Path, FileInfo> indexMap) {
-        this.indexMap = indexMap;
+    public FileIndex() {
+        indexMap = new ConcurrentHashMap<>();
     }
 
     public FileInfo getFileInfo(Path path) {
