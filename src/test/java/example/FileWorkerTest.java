@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 
 import static org.junit.jupiter.api.Assertions.*;
+import java.io.IOException;
 
 class FileWorkerTest {
 
@@ -35,6 +36,95 @@ class FileWorkerTest {
     void setUp() {
         filesStat = new FilesStat();
         fileIndex = new FileIndex();
+    }
+
+    @Test
+    @Timeout(10)
+    void replacingIndexedFileWithDirectoryShouldRemoveEntryWithoutRecovery()
+            throws Exception {
+        Path file = Files.write(tempDir.resolve("notes.md"), new byte[10]);
+        BlockingQueue<WorkerTask> queue = new ArrayBlockingQueue<>(10);
+        CountDownLatch initialProcessed = new CountDownLatch(1);
+        CountDownLatch modifyEntered = new CountDownLatch(1);
+        CountDownLatch allowModify = new CountDownLatch(1);
+        CountDownLatch modificationProcessed = new CountDownLatch(1);
+        AtomicInteger failureCalls = new AtomicInteger();
+        AtomicInteger successCalls = new AtomicInteger();
+        AtomicReference<Throwable> workerFailure = new AtomicReference<>();
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        TaskRouter router = new TaskRouter(List.of(queue));
+        FileRecoveryCoordinator recovery = new FileRecoveryCoordinator(
+                scheduler, router, 3, (task, cause) -> { }
+        ) {
+            @Override
+            public boolean onFailure(FileTask task, IOException cause) {
+                failureCalls.incrementAndGet();
+                return super.onFailure(task, cause);
+            }
+
+            @Override
+            public void onSuccess(Path path) {
+                successCalls.incrementAndGet();
+                super.onSuccess(path);
+            }
+        };
+        FileTaskProcessor processor = task -> {
+            if (task.changeType() == ChangeType.MODIFIED) {
+                modifyEntered.countDown();
+                allowModify.await();
+            }
+            return FileProcessor.process(task);
+        };
+        Thread worker = new Thread(new FileWorker(
+                queue, filesStat, fileIndex, recovery, processor, indexStateLock
+        ), "FileReplacedWithDirectoryTest");
+        worker.setUncaughtExceptionHandler((thread, cause) -> workerFailure.set(cause));
+
+        try {
+            worker.start();
+            queue.put(new FileTask(file, ChangeType.CREATED));
+            queue.put(new BarrierTask(initialProcessed));
+            assertTrue(initialProcessed.await(2, TimeUnit.SECONDS),
+                    "Worker не обработал исходный файл");
+            assertEquals(10, fileIndex.getFileInfo(file).fileSize());
+            assertEquals(1, filesStat.countFiles());
+            assertEquals(10, filesStat.totalBytes());
+            assertEquals(0, filesStat.countError());
+
+            queue.put(new FileTask(file, ChangeType.MODIFIED));
+            queue.put(new BarrierTask(modificationProcessed));
+            assertTrue(modifyEntered.await(2, TimeUnit.SECONDS),
+                    "Worker не вошёл в обработку MODIFY");
+
+            // Меняем тип пути после получения задачи, но до чтения атрибутов.
+            Files.delete(file);
+            Files.createDirectory(file);
+            assertTrue(Files.isDirectory(file));
+            allowModify.countDown();
+            assertTrue(modificationProcessed.await(2, TimeUnit.SECONDS),
+                    "Worker не обработал замену файла папкой");
+
+            assertNull(fileIndex.getFileInfo(file));
+            assertTrue(fileIndex.snapshotMap().isEmpty());
+            assertEquals(0, filesStat.countFiles());
+            assertEquals(0, filesStat.totalBytes());
+            assertEquals(0, filesStat.countError());
+            assertEquals(0, failureCalls.get(), "Recovery не должен запускаться для папки");
+            assertEquals(2, successCalls.get(),
+                    "CREATE и удаление неподходящей записи должны закрывать recovery");
+
+            queue.put(new StopTask());
+            worker.join(2_000);
+            assertFalse(worker.isAlive(), "Worker не завершился после StopTask");
+            assertNull(workerFailure.get(), "Worker завершился с необработанной ошибкой");
+        } finally {
+            allowModify.countDown();
+            worker.interrupt();
+            worker.join(2_000);
+            recovery.shutdown();
+            scheduler.shutdownNow();
+            assertTrue(scheduler.awaitTermination(2, TimeUnit.SECONDS));
+        }
     }
 
     @Test

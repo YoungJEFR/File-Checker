@@ -1,61 +1,140 @@
 package org.example;
 
-import org.example.model.FileIndexerSnapshot;
+import org.example.model.*;
 import org.example.service.FileIndexerService;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.Scanner;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 
 public class Main {
 
     private static final int WORKER_COUNT = 3;
     private static final int MAX_RECOVERY_ATTEMPTS = 3;
+    private final static BlockingQueue<MainEvent> events = new LinkedBlockingQueue<>();
+    private final static Thread consoleLineThread = new Thread(() -> {
+        Scanner scanner = new Scanner(System.in);
+
+        try {
+            while (scanner.hasNextLine()) {
+                events.put(new ConsoleLineEvent(scanner.nextLine()));
+            }
+            events.put(new ConsoleClosableInvent());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+
+    });
+
 
     public static void main(String[] args) {
-        try (Scanner console = new Scanner(System.in)) {
-            System.out.println("Введите путь к папке:");
 
-            Path root = Path.of(console.nextLine())
-                    .toAbsolutePath()
-                    .normalize();
+        try {
+            long countAttempt = 0;
+            consoleLineThread.setDaemon(true);
+            consoleLineThread.start();
 
-            if (!Files.isDirectory(root)) {
-                System.out.println("Папка не найдена");
-                return;
-            }
+            while (true) {
+                System.out.println("Введите путь к папке:");
 
-            FileIndexerService indexerService = new FileIndexerService(
-                    WORKER_COUNT,
-                    root,
-                    MAX_RECOVERY_ATTEMPTS
-            );
+                var mainResult = events.take();
 
-            try {
-                indexerService.start();
+                if (mainResult instanceof ConsoleClosableInvent) {
+                    consoleLineThread.interrupt();
+                    consoleLineThread.join();
+                    return;
+                }
 
-                FileIndexerSnapshot snapshot = indexerService.snapshot();
+                if (!(mainResult instanceof ConsoleLineEvent(String line))) {
+                    continue;
+                }
 
-                printState(snapshot);
+                if (line.isBlank()) {
+                    continue;
+                }
 
-                System.out.println("---- Нажмите Enter для завершения ----");
-                console.nextLine();
-            } finally {
-                indexerService.shutdown();
+                Path root;
 
-                FileIndexerSnapshot finalSnapshot =
-                        indexerService.snapshot();
+                try {
+                    root = Path.of(line)
+                            .toAbsolutePath()
+                            .normalize();
+                } catch (InvalidPathException e) {
+                    System.out.println(e.getMessage());
+                    continue;
+                }
 
-                System.out.println("Итоговое состояние:");
-                printState(finalSnapshot);
+
+
+                if (!Files.isDirectory(root)) {
+                    System.out.println("Папка не найдена");
+                    continue;
+                }
+
+                FileIndexerService indexerService = new FileIndexerService(
+                        WORKER_COUNT,
+                        root,
+                        MAX_RECOVERY_ATTEMPTS
+                );
+
+                countAttempt++;
+                try {
+                    long currentRunId = countAttempt;
+                    indexerService.getTermination()
+                            .whenComplete((terminationResult, throwable) -> {
+                                events.offer(new ServiceTerminatedEvent(currentRunId, throwable));
+                            });
+
+                    indexerService.start();
+
+                    FileIndexerSnapshot snapshot = indexerService.snapshot();
+
+                    printState(snapshot);
+
+                    while (true) {
+                        MainEvent event = events.take();
+
+                        if (event instanceof ServiceTerminatedEvent serviceTerminatedEvent) {
+                            if (currentRunId == serviceTerminatedEvent.runId()) {
+                                if (serviceTerminatedEvent.cause() == null) {
+                                    System.out.println("Сервис завершена корректно ");
+                                } else {
+                                    System.out.println("Сервис завершена с ошибкой " + serviceTerminatedEvent.cause());
+                                }
+                                break;
+                            }
+                        }
+                        if (event instanceof ConsoleClosableInvent) {
+                            indexerService.shutdown();
+                            return;
+                        }
+                        if (event instanceof ConsoleLineEvent consoleLineEvent) {
+                            indexerService.shutdown();
+                            break;
+                        }
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                } catch (RuntimeException e) {
+                    e.printStackTrace();
+                } finally {
+                    indexerService.shutdown();
+
+                    FileIndexerSnapshot finalSnapshot =
+                            indexerService.snapshot();
+
+                    System.out.println("Итоговое состояние:");
+                    printState(finalSnapshot);
+                }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            System.err.println("Поток прервали");
             return;
-        } catch (IOException e) {
-            e.printStackTrace();
         }
     }
 

@@ -2,11 +2,13 @@ package org.example.watcher;
 
 import org.example.model.ChangeType;
 import org.example.model.FileTask;
+import org.example.model.RootWatchLostException;
 import org.example.reconciliation.DirectoryReconciliationService;
 import org.example.route.TaskRouter;
 
 import java.io.IOException;
 import java.nio.file.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 
 public class FileWatcher implements Runnable {
@@ -16,7 +18,10 @@ public class FileWatcher implements Runnable {
     private final TaskRouter taskRouter;
     private final WatchRegistrar watchRegistrar;
     private final DirectoryReconciliationService reconciliationService;
-    private IOException startupFailure;
+    private Exception startupFailure;
+
+    private final CompletableFuture<Void> termination =
+            new CompletableFuture<>();
 
     public FileWatcher(
             Path path,
@@ -26,7 +31,7 @@ public class FileWatcher implements Runnable {
             DirectoryReconciliationService reconciliationService,
             CountDownLatch watcherReady
     ) {
-        this.path = path;
+        this.path = path.toAbsolutePath().normalize();
         this.debounce = debounce;
         this.taskRouter = taskRouter;
         this.watchRegistrar = watchRegistrar;
@@ -34,7 +39,8 @@ public class FileWatcher implements Runnable {
         this.watcherReady = watcherReady;
     }
 
-    public void watch() throws IOException, InterruptedException {
+    public void watch()
+            throws IOException, InterruptedException {
         try (WatchService watcher = FileSystems.getDefault().newWatchService()) {
             watchRegistrar.registerRecursively(path, watcher);
 
@@ -43,15 +49,14 @@ public class FileWatcher implements Runnable {
 
             while (true) {
                 WatchKey key = watcher.take();
-                Path directory = watchRegistrar
-                        .directoryFor(key)
-                        .toAbsolutePath()
-                        .normalize();
+                Path directory = watchRegistrar.directoryFor(key);
 
                 if (directory == null) {
                     key.reset();
                     continue;
                 }
+
+                directory = directory.toAbsolutePath().normalize();
 
                 for (WatchEvent<?> event : key.pollEvents()) {
                     WatchEvent.Kind<?> kind = event.kind();
@@ -101,6 +106,10 @@ public class FileWatcher implements Runnable {
                 if (!key.reset()) {
                     watchRegistrar.remove(key);
 
+                    if (directory.equals(path)) {
+                        throw new RootWatchLostException("Root directory lost " + path.toString());
+                    }
+
                     if (watchRegistrar.isEmpty()) {
                         break;
                     }
@@ -127,21 +136,35 @@ public class FileWatcher implements Runnable {
         requestRescan(directory);
     }
 
-    public IOException getStartupFailure() {
+    public Exception getStartupFailure() {
         return startupFailure;
+    }
+
+    public CompletableFuture<Void> getTermination() {
+        return termination.copy();
     }
 
     @Override
     public void run() {
         try {
             watch();
+            termination.complete(null);
         } catch (InterruptedException t) {
             Thread.currentThread().interrupt();
+            termination.complete(null);
+        } catch (RootWatchLostException e) {
+            startupFailure = e;
+            termination.completeExceptionally(e);
         } catch (java.io.IOException e) {
             e.printStackTrace();
             startupFailure = e;
+            termination.completeExceptionally(e);
+        } catch (RuntimeException e) {
+            startupFailure = e;
+            termination.completeExceptionally(e);
         } finally {
-            watcherReady.countDown();
+        watcherReady.countDown();
+            termination.complete(null);
         }
     }
 }

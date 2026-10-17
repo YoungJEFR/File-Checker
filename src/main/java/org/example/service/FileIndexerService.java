@@ -18,14 +18,14 @@ import org.example.watcher.WatchRegistrar;
 
 import java.io.IOException;
 import java.nio.file.Path;
-import java.nio.file.WatchKey;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 
 
 public class FileIndexerService implements AutoCloseable {
+    /*Класс отвечает за жизненный цикл программы*/
     private final Path root;
     private final List<BlockingQueue<WorkerTask>> queues;
     private final FilesStat filesStat;
@@ -47,8 +47,13 @@ public class FileIndexerService implements AutoCloseable {
     private final FileProducer producer;
     private final Object indexStateLock = new Object();
 
+    private final Thread watcherSupervisorThread;
     private FileIndexerState indexerState = FileIndexerState.NEW;
     private final Object lifecycleLock = new Object();
+    private final CompletableFuture<Void> termination =
+            new CompletableFuture<>();
+    private final AtomicReference<Throwable> terminationFailure =
+            new AtomicReference<>();
 
     FileIndexerService(
             int workerCount,
@@ -82,6 +87,21 @@ public class FileIndexerService implements AutoCloseable {
             FileScanner scanner,
             FileIndex index
     ) {
+        this(workerCount, root, maxRecoveryAttempts, queueCapacity,
+                processor, scanner, index, new WatchRegistrar(new ConcurrentHashMap<>()));
+    }
+
+    FileIndexerService(
+            int workerCount,
+            Path root,
+            int maxRecoveryAttempts,
+            int queueCapacity,
+            FileTaskProcessor processor,
+            FileScanner scanner,
+            FileIndex index,
+            WatchRegistrar watchRegistrar
+    ) {
+        java.util.Objects.requireNonNull(watchRegistrar, "watchRegistrar");
         this.root = root.toAbsolutePath().normalize();
 
         queues = createQueues(workerCount, queueCapacity);
@@ -113,9 +133,6 @@ public class FileIndexerService implements AutoCloseable {
                         taskRouter
                 );
 
-        Map<WatchKey, Path> registeredDirectories =
-                new ConcurrentHashMap<>();
-
         DirectoryReconciler directoryReconciler =
                 new DirectoryReconciler(
                         fileScanner,
@@ -146,12 +163,6 @@ public class FileIndexerService implements AutoCloseable {
         workers = new Thread[queues.size()];
         createWorkers(processor);
 
-        WatchRegistrar watchRegistrar =
-                new WatchRegistrar(
-                        registeredDirectories
-                );
-
-
         watcherReady = new CountDownLatch(1);
 
         fileWatcher = new FileWatcher(
@@ -176,6 +187,26 @@ public class FileIndexerService implements AutoCloseable {
                 new Thread(this.producer, "Producer");
 
 
+        Runnable fileWatcherRunnable = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    fileWatcher.getTermination().get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    terminationFailure.compareAndSet(null, e);
+                } catch (ExecutionException e) {
+                    e.getCause().printStackTrace();
+                    terminationFailure.compareAndSet(null, e.getCause());
+
+                }
+
+                shutdown();
+            }
+        };
+
+        watcherSupervisorThread =
+                new Thread(fileWatcherRunnable, "WatcherSupervisor");
     }
 
     public FileIndexerService(
@@ -230,10 +261,12 @@ public class FileIndexerService implements AutoCloseable {
             }
             watcherReady.await();
 
-            IOException startupFailure = fileWatcher.getStartupFailure();
+            Exception startupFailure = fileWatcher.getStartupFailure();
 
-            if (startupFailure != null) {
-                throw startupFailure;
+            if (startupFailure instanceof IOException) {
+                throw (IOException) startupFailure;
+            } else if (startupFailure instanceof RuntimeException) {
+                throw (RuntimeException) startupFailure;
             }
 
             runInitialScan();
@@ -243,9 +276,11 @@ public class FileIndexerService implements AutoCloseable {
             synchronized (lifecycleLock) {
                 if (indexerState == FileIndexerState.STARTING) {
                     indexerState = FileIndexerState.RUNNING;
+                    watcherSupervisorThread.start();
                 }
             }
         } catch (InterruptedException | IOException | RuntimeException e) {
+            terminationFailure.compareAndSet(null, e);
             shutdown();
             throw e;
         }
@@ -286,7 +321,6 @@ public class FileIndexerService implements AutoCloseable {
         if (failure != null) {
             throw failure;
         }
-
     }
 
     private void awaitInitialProcessing()
@@ -364,12 +398,9 @@ public class FileIndexerService implements AutoCloseable {
 
     public void shutdown() {
         boolean wasInterrupted = false;
+        boolean performCleanup = false;
 
         synchronized (lifecycleLock) {
-
-            if (indexerState == FileIndexerState.STOPPED) {
-                return;
-            }
             while (indexerState == FileIndexerState.STOPPING) {
                 try {
                     lifecycleLock.wait();
@@ -378,67 +409,78 @@ public class FileIndexerService implements AutoCloseable {
                 }
             }
 
-            if (indexerState == FileIndexerState.STOPPED) {
-                if (wasInterrupted) {
-                    Thread.currentThread().interrupt();
-                }
-
-                return;
+            if (indexerState != FileIndexerState.STOPPED) {
+                indexerState = FileIndexerState.STOPPING;
+                performCleanup = true;
             }
-
-            indexerState = FileIndexerState.STOPPING;
         }
 
-
         try {
-            System.out.println("Начинаем остановку");
+            if (performCleanup) {
+                try {
+                    System.out.println("Начинаем остановку");
 
-            try {
-                stopWatcher();
-            } catch (InterruptedException e) {
-                wasInterrupted = true;
+                    try {
+                        stopWatcher();
+                    } catch (InterruptedException e) {
+                        wasInterrupted = true;
+                    }
+
+                    try {
+                        stopProducer();
+                    } catch (InterruptedException e) {
+                        wasInterrupted = true;
+                    }
+
+                    reconciliationService.shutdown();
+                    fileRecoveryCoordinator.shutdown();
+                    debounce.shutdown();
+
+                    try {
+                        stopExecutor(debounceExecutor);
+                    } catch (InterruptedException e) {
+                        wasInterrupted = true;
+                    }
+
+                    try {
+                        stopExecutor(rescanExecutor);
+                    } catch (InterruptedException e) {
+                        wasInterrupted = true;
+                    }
+
+                    try {
+                        cancelScheduledRecoveries();
+                    } catch (InterruptedException e) {
+                        wasInterrupted = true;
+                    }
+
+                    try {
+                        stopWorkers();
+                    } catch (InterruptedException e) {
+                        wasInterrupted = true;
+                    }
+
+                } finally {
+                    synchronized (lifecycleLock) {
+                        indexerState = FileIndexerState.STOPPED;
+                        lifecycleLock.notifyAll();
+                    }
+                }
             }
-
-            try {
-                stopProducer();
-            } catch (InterruptedException e) {
-                wasInterrupted = true;
-            }
-
-            reconciliationService.shutdown();
-
-            fileRecoveryCoordinator.shutdown();
-
-            debounce.shutdown();
-
-            try {
-                stopExecutor(debounceExecutor);
-            } catch (InterruptedException e) {
-                wasInterrupted = true;
-            }
-
-            try {
-                stopExecutor(rescanExecutor);
-            } catch (InterruptedException e) {
-                wasInterrupted = true;
-            }
-
-            try {
-                cancelScheduledRecoveries();
-            } catch (InterruptedException e) {
-                wasInterrupted = true;
-            }
-
-            try {
-                stopWorkers();
-            } catch (InterruptedException e) {
-                wasInterrupted = true;
-            }
-
         } finally {
-            synchronized (lifecycleLock) {
-                indexerState = FileIndexerState.STOPPED;
-                lifecycleLock.notifyAll();
+            try {
+                awaitSupervisorTermination();
+            } catch (InterruptedException e) {
+                wasInterrupted = true;
+            }
+
+            if (performCleanup) {
+                var terminationResult = terminationFailure.get();
+                if (terminationResult == null) {
+                    termination.complete(null);
+                } else {
+                    termination.completeExceptionally(terminationResult);
+                }
             }
 
             if (wasInterrupted) {
@@ -446,6 +488,25 @@ public class FileIndexerService implements AutoCloseable {
             }
         }
     }
+
+    private void awaitSupervisorTermination() throws InterruptedException {
+        if (Thread.currentThread() == watcherSupervisorThread) {
+            return;
+        }
+        boolean wasInterrupted = false;
+        while (watcherSupervisorThread.isAlive()) {
+            try {
+                watcherSupervisorThread.join();
+            } catch (InterruptedException e) {
+                wasInterrupted = true;
+            }
+        }
+
+        if (wasInterrupted) {
+            throw new InterruptedException();
+        }
+    }
+
 
     private void interruptAndJoin(Thread thread)
             throws InterruptedException {
@@ -510,6 +571,10 @@ public class FileIndexerService implements AutoCloseable {
     @Override
     public void close() {
         shutdown();
+    }
+
+    public CompletableFuture<Void> getTermination() {
+        return termination.copy();
     }
 
     public FileIndexerSnapshot snapshot() {

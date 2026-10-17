@@ -53,7 +53,7 @@ public class FileChangeDebounce {
                                         return null;
                                     }
 
-                                    return actualPending;
+                                        return actualPending;
                                 });
                             }
                         },

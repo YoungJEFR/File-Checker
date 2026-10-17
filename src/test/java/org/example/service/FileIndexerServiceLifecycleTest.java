@@ -6,6 +6,8 @@ import org.example.pipeline.FileWorker;
 import org.example.processor.FileIndex;
 import org.example.processor.FileProcessor;
 import org.example.processor.FileTaskProcessor;
+import org.example.watcher.FileWatcher;
+import org.example.watcher.WatchRegistrar;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -16,9 +18,12 @@ import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.WatchKey;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -31,6 +36,197 @@ class FileIndexerServiceLifecycleTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    @Timeout(10)
+    void normalShutdownShouldCompleteServiceTerminationSuccessfully() throws Exception {
+        FileIndexerService service = new FileIndexerService(2, tempDir, 3);
+        List<Thread> threads = ownedThreads(service);
+
+        try {
+            service.start();
+            // Сохраняем одну копию: она должна получить результат будущей остановки.
+            CompletableFuture<Void> termination = service.getTermination();
+            assertFalse(termination.isDone(), "Работающий сервис не должен сообщать о завершении");
+
+            service.shutdown();
+
+            assertNull(termination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertTrue(termination.isDone());
+            assertFalse(termination.isCompletedExceptionally(),
+                    "Обычный shutdown не должен завершаться с ошибкой");
+            assertFullyStopped(service, threads);
+            for (String name : List.of("debounceExecutor", "rescanExecutor", "recoveryExecutor")) {
+                Field field = FileIndexerService.class.getDeclaredField(name);
+                field.setAccessible(true);
+                assertTrue(((ExecutorService) field.get(service)).isTerminated(),
+                        name + " остался работать после завершения сервиса");
+            }
+
+            // Повторная остановка не должна менять ранее опубликованный результат.
+            service.shutdown();
+            assertNull(termination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+        } finally {
+            service.shutdown();
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void deletingNestedDirectoryShouldKeepServiceRunning() throws Exception {
+        Path root = Files.createDirectory(tempDir.resolve("watched"))
+                .toAbsolutePath().normalize();
+        Path nested = Files.createDirectory(root.resolve("nested"));
+        Path oldFile = Files.write(nested.resolve("old.md"), new byte[10]);
+        Map<WatchKey, Path> registrations = new ConcurrentHashMap<>();
+        FileIndexerService service = new FileIndexerService(
+                2, root, 3, 100, FileProcessor::process, new FileScanner(),
+                new FileIndex(), new WatchRegistrar(registrations)
+        );
+        List<Thread> threads = ownedThreads(service);
+
+        try {
+            service.start();
+            assertEquals(Set.of(root, nested), Set.copyOf(registrations.values()));
+            assertEquals(Set.of(oldFile), service.snapshot().files().keySet());
+            assertEquals(10, service.snapshot().totalBytes());
+
+            Files.delete(oldFile);
+            Files.delete(nested);
+
+            // Ждём и очистку индекса, и удаление невалидного ключа вложенной папки.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+            FileIndexerSnapshot snapshot = service.snapshot();
+            while (System.nanoTime() < deadline
+                    && !(registrations.size() == 1 && registrations.containsValue(root)
+                    && snapshot.files().isEmpty() && snapshot.countFiles() == 0
+                    && snapshot.totalBytes() == 0)) {
+                Thread.sleep(20);
+                snapshot = service.snapshot();
+            }
+            assertEquals(Set.of(root), Set.copyOf(registrations.values()),
+                    "Удаление вложенной папки должно убрать только её регистрацию");
+            assertTrue(snapshot.files().isEmpty());
+            assertEquals(0, snapshot.countFiles());
+            assertEquals(0, snapshot.totalBytes());
+            assertEquals(FileIndexerState.RUNNING, stateOf(service));
+            assertTrue(threadField(service, "watcherThread").isAlive());
+            assertTrue(threadField(service, "watcherSupervisorThread").isAlive());
+
+            // Не только проверяем флаг: watcher должен обработать новое событие после удаления.
+            Path newFile = Files.write(root.resolve("still-watched.md"), new byte[20]);
+            deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+            snapshot = service.snapshot();
+            while (System.nanoTime() < deadline
+                    && !(snapshot.files().keySet().equals(Set.of(newFile))
+                    && snapshot.countFiles() == 1 && snapshot.totalBytes() == 20)) {
+                Thread.sleep(20);
+                snapshot = service.snapshot();
+            }
+            assertEquals(Set.of(newFile), snapshot.files().keySet());
+            assertEquals(1, snapshot.countFiles());
+            assertEquals(20, snapshot.totalBytes());
+            assertEquals(0, snapshot.errorCount());
+            assertEquals(FileIndexerState.RUNNING, stateOf(service));
+        } finally {
+            service.shutdown();
+        }
+        assertFullyStopped(service, threads);
+    }
+
+    @Test
+    @Timeout(10)
+    void deletingRootShouldAutomaticallyShutdownService() throws Exception {
+        Path root = Files.createDirectory(tempDir.resolve("watched"));
+        FileIndexerService service = new FileIndexerService(2, root, 3);
+        List<Thread> threads = ownedThreads(service);
+        Thread supervisor = threadField(service, "watcherSupervisorThread");
+        AtomicReference<Throwable> supervisorFailure = new AtomicReference<>();
+        supervisor.setUncaughtExceptionHandler((thread, failure) -> supervisorFailure.set(failure));
+        Field watcherField = FileIndexerService.class.getDeclaredField("fileWatcher");
+        watcherField.setAccessible(true);
+        FileWatcher watcher = (FileWatcher) watcherField.get(service);
+
+        try {
+            service.start();
+            assertEquals(FileIndexerState.RUNNING, stateOf(service));
+            assertTrue(threadField(service, "watcherThread").isAlive());
+            assertTrue(supervisor.isAlive());
+            CompletableFuture<Void> termination = watcher.getTermination();
+            CompletableFuture<Void> serviceTermination = service.getTermination();
+            assertFalse(serviceTermination.isDone(), "Работающий сервис ещё не завершён");
+
+            // Удаляем только созданный пустой корень, не саму @TempDir.
+            Files.delete(root);
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> termination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertInstanceOf(RootWatchLostException.class, failure.getCause());
+            assertTrue(failure.getCause().getMessage().contains(root.toString()));
+
+            ExecutionException serviceFailure = assertThrows(ExecutionException.class,
+                    () -> serviceTermination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertSame(failure.getCause(), serviceFailure.getCause(),
+                    "Сервис должен сохранить исходную причину завершения watcher");
+            assertTrue(serviceTermination.isCompletedExceptionally());
+            // Сигнал сервиса должен приходить после очистки, не только после выхода watcher.
+            assertEquals(FileIndexerState.STOPPED, stateOf(service));
+            for (Thread thread : threads) {
+                if (thread != supervisor) {
+                    assertFalse(thread.isAlive(), thread.getName() + " остался работать");
+                }
+            }
+            for (String name : List.of("debounceExecutor", "rescanExecutor", "recoveryExecutor")) {
+                Field field = FileIndexerService.class.getDeclaredField(name);
+                field.setAccessible(true);
+                assertTrue(((ExecutorService) field.get(service)).isTerminated(),
+                        name + " остался работать после потери корня");
+            }
+            // Supervisor публикует результат перед выходом из своего run(): ждём и этот выход.
+            supervisor.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            assertFalse(supervisor.isAlive(), "Supervisor не остановил сервис после потери корня");
+            assertNull(supervisorFailure.get());
+            assertFullyStopped(service, threads);
+        } finally {
+            // До проверок shutdown не вызываем: остановка должна произойти автоматически.
+            service.shutdown();
+        }
+    }
+
+    @Test
+    @Timeout(10)
+    void interruptingSupervisorShouldShutdownService() throws Exception {
+        FileIndexerService service = new FileIndexerService(2, tempDir, 3);
+        List<Thread> threads = ownedThreads(service);
+        Thread supervisor = threadField(service, "watcherSupervisorThread");
+        AtomicReference<Throwable> supervisorFailure = new AtomicReference<>();
+        supervisor.setUncaughtExceptionHandler((thread, failure) -> supervisorFailure.set(failure));
+
+        try {
+            service.start();
+            assertEquals(FileIndexerState.RUNNING, stateOf(service));
+            assertTrue(supervisor.isAlive(), "Supervisor не запущен");
+            assertTrue(threadField(service, "watcherThread").isAlive(),
+                    "Watcher должен работать до прерывания supervisor");
+
+            supervisor.interrupt();
+            supervisor.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+
+            assertFalse(supervisor.isAlive(), "Supervisor не завершился после прерывания");
+            assertNull(supervisorFailure.get(), "Supervisor завершился с необработанной ошибкой");
+            // Не вызываем shutdown() до проверок: остановить сервис должен сам supervisor.
+            assertFullyStopped(service, threads);
+            for (String name : List.of("debounceExecutor", "rescanExecutor", "recoveryExecutor")) {
+                Field field = FileIndexerService.class.getDeclaredField(name);
+                field.setAccessible(true);
+                ExecutorService executor = (ExecutorService) field.get(service);
+                assertTrue(executor.isTerminated(), name + " остался работать");
+            }
+        } finally {
+            // Очистка нужна и при падении теста, например если в catch вернули return.
+            service.shutdown();
+        }
+    }
 
     @Test
     @Timeout(10)
@@ -544,6 +740,7 @@ class FileIndexerServiceLifecycleTest {
 
         result.add(threadField(service, "watcherThread"));
         result.add(threadField(service, "producerThread"));
+        result.add(threadField(service, "watcherSupervisorThread"));
         return result;
     }
 

@@ -1,6 +1,7 @@
 package org.example.watcher;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.*;
 import java.util.Iterator;
 import java.util.Map;
@@ -8,10 +9,22 @@ import java.util.stream.Stream;
 
 public final class WatchRegistrar {
 
+    @FunctionalInterface
+    public interface DirectoryWalker {
+        Stream<Path> walk(Path root) throws IOException;
+    }
+
     private final Map<WatchKey, Path> registeredDirectories;
+    private final DirectoryWalker directoryWalker;
 
     public WatchRegistrar(Map<WatchKey, Path> registeredDirectories) {
+        this(registeredDirectories, Files::walk);
+    }
+
+    public WatchRegistrar(Map<WatchKey, Path> registeredDirectories,
+                          DirectoryWalker directoryWalker) {
         this.registeredDirectories = registeredDirectories;
+        this.directoryWalker = java.util.Objects.requireNonNull(directoryWalker, "directoryWalker");
     }
 
     public void registerRecursively(
@@ -19,7 +32,7 @@ public final class WatchRegistrar {
             WatchService watchService
     ) throws IOException {
 
-        try (Stream<Path> paths = Files.walk(root   )) {
+        try (Stream<Path> paths = directoryWalker.walk(root)) {
             Iterator<Path> directories = paths
                     .filter(Files::isDirectory)
                     .iterator();
@@ -27,6 +40,8 @@ public final class WatchRegistrar {
             while (directories.hasNext()) {
                 register(directories.next(), watchService);
             }
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
         }
     }
 

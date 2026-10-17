@@ -113,7 +113,7 @@ public class FileWorker implements Runnable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
-            } catch (NoSuchFileException e) {
+            } catch (NoSuchFileException | NotRegularFileException e) {
                 deleteIndexInMap(
                         fileIndex,
                         fileTask,
@@ -121,7 +121,6 @@ public class FileWorker implements Runnable {
                         fileRecoveryCoordinator,
                         indexStateLock
                 );
-
             } catch (IOException e) {
                 boolean recoveryStarted = fileRecoveryCoordinator.onFailure(fileTask, e);
 
@@ -140,9 +139,9 @@ public class FileWorker implements Runnable {
             FileTask fileTask,
             FilesStat filesStat,
             FileRecoveryCoordinator fileRecoveryCoordinator,
-            Object  indexStateLock
+            Object indexStateLock
     ) {
-        synchronized (indexStateLock){
+        synchronized (indexStateLock) {
             FileInfo removed = fileIndex.deleteInMap(fileTask.path());
             if (removed != null) {
                 filesStat.fileRemoved(removed.fileSize());
