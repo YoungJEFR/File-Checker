@@ -54,6 +54,8 @@ public class FileIndexerService implements AutoCloseable {
             new CompletableFuture<>();
     private final AtomicReference<Throwable> terminationFailure =
             new AtomicReference<>();
+    private final CompletableFuture<Void> workerFailure =
+            new CompletableFuture<>();
 
     FileIndexerService(
             int workerCount,
@@ -232,7 +234,8 @@ public class FileIndexerService implements AutoCloseable {
                     fileIndex,
                     fileRecoveryCoordinator,
                     processor,
-                    indexStateLock
+                    indexStateLock,
+                    workerFailure
             );
 
             workers[i] = new Thread(
@@ -308,7 +311,8 @@ public class FileIndexerService implements AutoCloseable {
         return queues;
     }
 
-    private void runInitialScan() throws InterruptedException, IOException {
+    private void runInitialScan() throws
+            InterruptedException, IOException {
         synchronized (lifecycleLock) {
             if (indexerState != FileIndexerState.STARTING) {
                 return;
@@ -316,28 +320,68 @@ public class FileIndexerService implements AutoCloseable {
             producerThread.start();
         }
 
-        producerThread.join();
-        IOException failure = producer.getScanFailure();
-        if (failure != null) {
-            throw failure;
+        try {
+            CompletableFuture.anyOf(
+                    producer.getCompletionFuture(),
+                    workerFailure
+            ).get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+
+            if (cause instanceof IOException ioException) {
+                throw ioException;
+            }
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            if (cause instanceof InterruptedException interruptedException) {
+                throw interruptedException;
+            }
+
+            throw new IllegalStateException("Initial sсan failed", cause);
         }
     }
 
     private void awaitInitialProcessing()
             throws InterruptedException {
-        CountDownLatch barrierReached =
-                new CountDownLatch(queues.size());
+        BarrierTask barrier = new BarrierTask(workers.length);
 
-        synchronized (lifecycleLock) {
-            if (indexerState != FileIndexerState.STARTING) {
-                return;
+
+        try {
+            for (int i = 0; i < workers.length; i++) {
+
+                boolean barrierSent = false;
+                while (!barrierSent) {
+                    if (workerFailure.isDone()) {
+                        workerFailure.get();
+
+                    }
+                    synchronized (lifecycleLock) {
+                        if (indexerState != FileIndexerState.STARTING) {
+                            return;
+                        }
+                        barrierSent = queues.get(i).offer(barrier);
+                    }
+                    if (!barrierSent) {
+                        Thread.sleep(50);
+                    }
+                }
             }
-            for (BlockingQueue<WorkerTask> queue : queues) {
-                queue.put(new BarrierTask(barrierReached));
+
+            CompletableFuture.anyOf(
+                    barrier.getCompletionFuture(),
+                    workerFailure
+            ).get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
             }
+
+            throw new IllegalStateException("worker failed", cause);
         }
 
-        barrierReached.await();
     }
 
     private void stopWatcher()
@@ -349,15 +393,17 @@ public class FileIndexerService implements AutoCloseable {
             throws InterruptedException {
         boolean wasInterrupted = false;
 
-        for (BlockingQueue<WorkerTask> queue : queues) {
+        for (int i = 0; i < queues.size(); i++) {
+            BlockingQueue<WorkerTask> queue = queues.get(i);
             boolean stopSent = false;
-            while (!stopSent) {
+
+            while (workers[i].isAlive() && !stopSent) {
                 try {
-                    queue.put(new StopTask());
-                    stopSent = true;
+                    stopSent = queue.offer(new StopTask(), 2, TimeUnit.SECONDS);
                 } catch (InterruptedException e) {
                     wasInterrupted = true;
                 }
+
             }
         }
 

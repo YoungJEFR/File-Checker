@@ -29,6 +29,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -97,7 +98,8 @@ class InitialScanConcurrencyTest {
                         filesStat,
                         fileIndex,
                         recoveryCoordinator,
-                        indexStateLock
+                        indexStateLock,
+                        new CompletableFuture<>()
                 ),
                 "InitialScanWorkerTest"
         );
@@ -165,15 +167,9 @@ class InitialScanConcurrencyTest {
                     "Initial scan не завершился"
             );
 
-            CountDownLatch barrierReached = new CountDownLatch(1);
-            queue.put(new BarrierTask(barrierReached));
-            assertTrue(
-                    barrierReached.await(
-                            TIMEOUT_SECONDS,
-                            TimeUnit.SECONDS
-                    ),
-                    "Worker не достиг барьера initial scan"
-            );
+            BarrierTask barrierReached = new BarrierTask(1);
+            queue.put(barrierReached);
+            barrierReached.getCompletionFuture().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             Set<Path> diskPaths = scanMarkdownPaths(tempDir);
             assertEquals(diskPaths, fileIndex.snapshotPaths());

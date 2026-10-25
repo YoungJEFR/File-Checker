@@ -44,10 +44,10 @@ class FileWorkerTest {
             throws Exception {
         Path file = Files.write(tempDir.resolve("notes.md"), new byte[10]);
         BlockingQueue<WorkerTask> queue = new ArrayBlockingQueue<>(10);
-        CountDownLatch initialProcessed = new CountDownLatch(1);
+        BarrierTask initialProcessed = new BarrierTask(1);
         CountDownLatch modifyEntered = new CountDownLatch(1);
         CountDownLatch allowModify = new CountDownLatch(1);
-        CountDownLatch modificationProcessed = new CountDownLatch(1);
+        BarrierTask modificationProcessed = new BarrierTask(1);
         AtomicInteger failureCalls = new AtomicInteger();
         AtomicInteger successCalls = new AtomicInteger();
         AtomicReference<Throwable> workerFailure = new AtomicReference<>();
@@ -76,23 +76,23 @@ class FileWorkerTest {
             return FileProcessor.process(task);
         };
         Thread worker = new Thread(new FileWorker(
-                queue, filesStat, fileIndex, recovery, processor, indexStateLock
+                queue, filesStat, fileIndex, recovery, processor, indexStateLock,
+                new CompletableFuture<>()
         ), "FileReplacedWithDirectoryTest");
         worker.setUncaughtExceptionHandler((thread, cause) -> workerFailure.set(cause));
 
         try {
             worker.start();
             queue.put(new FileTask(file, ChangeType.CREATED));
-            queue.put(new BarrierTask(initialProcessed));
-            assertTrue(initialProcessed.await(2, TimeUnit.SECONDS),
-                    "Worker не обработал исходный файл");
+            queue.put(initialProcessed);
+            initialProcessed.getCompletionFuture().get(2, TimeUnit.SECONDS);
             assertEquals(10, fileIndex.getFileInfo(file).fileSize());
             assertEquals(1, filesStat.countFiles());
             assertEquals(10, filesStat.totalBytes());
             assertEquals(0, filesStat.countError());
 
             queue.put(new FileTask(file, ChangeType.MODIFIED));
-            queue.put(new BarrierTask(modificationProcessed));
+            queue.put(modificationProcessed);
             assertTrue(modifyEntered.await(2, TimeUnit.SECONDS),
                     "Worker не вошёл в обработку MODIFY");
 
@@ -101,8 +101,7 @@ class FileWorkerTest {
             Files.createDirectory(file);
             assertTrue(Files.isDirectory(file));
             allowModify.countDown();
-            assertTrue(modificationProcessed.await(2, TimeUnit.SECONDS),
-                    "Worker не обработал замену файла папкой");
+            modificationProcessed.getCompletionFuture().get(2, TimeUnit.SECONDS);
 
             assertNull(fileIndex.getFileInfo(file));
             assertTrue(fileIndex.snapshotMap().isEmpty());
@@ -160,7 +159,8 @@ class FileWorkerTest {
                 fileIndex,
                 recoveryCoordinator,
                 processor,
-                indexStateLock
+                indexStateLock,
+                new CompletableFuture<>()
         );
         Thread workerThread = new Thread(
                 fileWorker,
@@ -246,7 +246,8 @@ class FileWorkerTest {
                         fileIndex,
                         recoveryCoordinator,
                         processor,
-                        indexStateLock
+                        indexStateLock,
+                        new CompletableFuture<>()
                 ),
                 "FullQueueFileWorkerTest"
         );
@@ -496,21 +497,18 @@ class FileWorkerTest {
                         filesStat,
                         fileIndex,
                         recoveryCoordinator,
-                        indexStateLock
+                        indexStateLock,
+                        new CompletableFuture<>()
                 ),
                 "BarrierWorkerTest"
         );
-        CountDownLatch barrierReached = new CountDownLatch(1);
+        BarrierTask barrierReached = new BarrierTask(1);
 
         try {
             workerThread.start();
             queue.put(new FileTask(firstFile, ChangeType.CREATED));
-            queue.put(new BarrierTask(barrierReached));
-
-            assertTrue(
-                    barrierReached.await(2, TimeUnit.SECONDS),
-                    "Worker не достиг BarrierTask"
-            );
+            queue.put(barrierReached);
+            barrierReached.getCompletionFuture().get(2, TimeUnit.SECONDS);
             assertEquals(10, fileIndex.getFileInfo(firstFile).fileSize());
             assertTrue(
                     workerThread.isAlive(),
@@ -559,7 +557,8 @@ class FileWorkerTest {
                         filesStat,
                         fileIndex,
                         recoveryCoordinator,
-                        indexStateLock
+                        indexStateLock,
+                        new CompletableFuture<>()
                 ),
                 "FileWorkerTest"
         );

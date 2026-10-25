@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.nio.file.NoSuchFileException;
 import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 
 public class FileWorker implements Runnable {
     private final BlockingQueue<WorkerTask> queue;
@@ -18,6 +19,7 @@ public class FileWorker implements Runnable {
     private final FileRecoveryCoordinator fileRecoveryCoordinator;
     private final FileTaskProcessor fileTaskProcessor;
     private final Object indexStateLock;
+    private final CompletableFuture<Void> workerFailure;
 
     public FileWorker(
             BlockingQueue<WorkerTask> queue,
@@ -25,7 +27,8 @@ public class FileWorker implements Runnable {
             FileIndex fileIndex,
             FileRecoveryCoordinator fileRecoveryCoordinator,
             FileTaskProcessor fileTaskProcessor,
-            Object indexStateLock
+            Object indexStateLock,
+            CompletableFuture<Void> workerFailure
     ) {
         this.queue = queue;
         this.filesStat = filesStat;
@@ -36,7 +39,10 @@ public class FileWorker implements Runnable {
                 "fileTaskProcessor must not be null"
         );
         this.indexStateLock = Objects.requireNonNull(indexStateLock);
-    }
+        this.workerFailure = Objects.requireNonNull(
+                workerFailure,
+                "workerFailure must not be null"
+        );    }
 
 
     public FileWorker(
@@ -44,7 +50,8 @@ public class FileWorker implements Runnable {
             FilesStat filesStat,
             FileIndex fileIndex,
             FileRecoveryCoordinator fileRecoveryCoordinator,
-            Object indexStateLock
+            Object indexStateLock,
+            CompletableFuture<Void> workerFailure
     ) {
         this(
                 queue,
@@ -52,7 +59,8 @@ public class FileWorker implements Runnable {
                 fileIndex,
                 fileRecoveryCoordinator,
                 FileProcessor::process,
-                indexStateLock
+                indexStateLock,
+                workerFailure
         );
     }
 
@@ -72,10 +80,8 @@ public class FileWorker implements Runnable {
                 return;
             }
 
-            if (workerTask instanceof BarrierTask(
-                    java.util.concurrent.CountDownLatch latch
-            )) {
-                latch.countDown();
+            if (workerTask instanceof BarrierTask barrierTask) {
+                barrierTask.arrive();
                 continue;
             }
 
@@ -129,6 +135,9 @@ public class FileWorker implements Runnable {
                         filesStat.recordError();
                     }
                 }
+            } catch (RuntimeException e) {
+                workerFailure.completeExceptionally(e);
+                return;
             }
         }
     }

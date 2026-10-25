@@ -38,6 +38,336 @@ class FileIndexerServiceLifecycleTest {
     Path tempDir;
 
     @Test
+    @Timeout(25)
+    void workerFailureWhileSendingBarrierToFullQueueShouldFailStart() throws Exception {
+        assertBarrierBackpressureScenario(true, false);
+    }
+
+    @Test
+    @Timeout(25)
+    void shutdownWhileSendingBarrierToFullQueueShouldCancelStart() throws Exception {
+        assertBarrierBackpressureScenario(false, true);
+    }
+
+    @Test
+    @Timeout(25)
+    void fullQueueShouldEventuallyAcceptBarrierAfterWorkerResumes() throws Exception {
+        assertBarrierBackpressureScenario(false, false);
+    }
+
+    private void assertBarrierBackpressureScenario(boolean workerFails, boolean concurrentShutdown)
+            throws Exception {
+        Path first = Files.writeString(tempDir.resolve("first.md"), "first");
+        Path second = Files.writeString(tempDir.resolve("second.md"), "second");
+        CountDownLatch processorEntered = new CountDownLatch(1);
+        CountDownLatch allowProcessing = new CountDownLatch(1);
+        IllegalStateException expected = new IllegalStateException("Worker failed before barrier");
+        AtomicReference<Throwable> startFailure = new AtomicReference<>();
+        AtomicReference<Throwable> shutdownFailure = new AtomicReference<>();
+        FileScanner scanner = new FileScanner() {
+            @Override
+            public void scanFile(Path root, FileHandler handler) throws InterruptedException {
+                handler.handle(first);
+                processorEntered.await();
+                handler.handle(second);
+                // В отличие от теста с третьим файлом, Producer здесь заканчивает работу.
+            }
+        };
+        FileIndexerService service = new FileIndexerService(1, tempDir, 3, 1, task -> {
+            processorEntered.countDown();
+            allowProcessing.await();
+            if (workerFails) {
+                throw expected;
+            }
+            return FileProcessor.process(task);
+        }, scanner);
+        List<Thread> threads = ownedThreads(service);
+        BlockingQueue<WorkerTask> queue = queuesOf(service).get(0);
+        Thread producer = threadField(service, "producerThread");
+        CompletableFuture<Void> termination = service.getTermination();
+        Thread startThread = new Thread(() -> {
+            try {
+                service.start();
+            } catch (Throwable failure) {
+                startFailure.set(failure);
+            }
+        }, "BarrierBackpressureStartTest");
+        Thread shutdownThread = new Thread(() -> {
+            try {
+                service.shutdown();
+            } catch (Throwable failure) {
+                shutdownFailure.set(failure);
+            }
+        }, "BarrierBackpressureShutdownTest");
+
+        try {
+            startThread.start();
+            assertTrue(processorEntered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            // Проверяем именно ожидание отправки барьера, а не просто задержку запуска.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+            boolean sendingBarrier = false;
+            while (System.nanoTime() < deadline) {
+                sendingBarrier = startThread.getState() == Thread.State.TIMED_WAITING
+                        && Arrays.stream(startThread.getStackTrace()).anyMatch(frame ->
+                        frame.getClassName().equals(FileIndexerService.class.getName())
+                                && frame.getMethodName().equals("awaitInitialProcessing"));
+                if (sendingBarrier) {
+                    break;
+                }
+                Thread.sleep(10);
+            }
+            assertTrue(sendingBarrier, "start() не дошёл до ожидания места для BarrierTask");
+            producer.join(1_000);
+            assertFalse(producer.isAlive(), "Producer уже должен завершить initial scan");
+            assertEquals(new FileTask(second, ChangeType.CREATED), queue.peek());
+            assertEquals(0, queue.remainingCapacity());
+
+            if (concurrentShutdown) {
+                shutdownThread.start();
+                // STOPPING доказывает, что shutdown смог получить lifecycleLock,
+                // пока start() ожидал места. Worker пока ещё не освобождаем.
+                deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+                while (stateOf(service) != FileIndexerState.STOPPING && System.nanoTime() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertEquals(FileIndexerState.STOPPING, stateOf(service));
+                startThread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+                assertFalse(startThread.isAlive(), "Shutdown не отменил отправку барьера");
+            }
+
+            allowProcessing.countDown();
+            startThread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            assertFalse(startThread.isAlive(), "start() завис при отправке барьера");
+            if (workerFails) {
+                assertSame(expected, startFailure.get());
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> termination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+                assertSame(expected, failure.getCause());
+            } else {
+                assertNull(startFailure.get());
+                if (!concurrentShutdown) {
+                    assertEquals(FileIndexerState.RUNNING, stateOf(service));
+                    assertEquals(Set.of(first, second), service.snapshot().files().keySet());
+                    assertFalse(termination.isDone());
+                    service.shutdown();
+                }
+                shutdownThread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+                assertFalse(shutdownThread.isAlive());
+                assertNull(shutdownFailure.get());
+                assertNull(termination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            }
+            assertFullyStopped(service, threads);
+            for (String name : List.of("debounceExecutor", "rescanExecutor", "recoveryExecutor")) {
+                Field field = FileIndexerService.class.getDeclaredField(name);
+                field.setAccessible(true);
+                assertTrue(((ExecutorService) field.get(service)).isTerminated(), name);
+            }
+        } finally {
+            allowProcessing.countDown();
+            producer.interrupt();
+            threads.get(0).interrupt();
+            startThread.interrupt();
+            producer.join(2_000);
+            threads.get(0).join(2_000);
+            assertFalse(producer.isAlive());
+            assertFalse(threads.get(0).isAlive());
+            // Только аварийная уборка красного теста: Worker уже не обрабатывает очередь.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+            while ((startThread.isAlive() || shutdownThread.isAlive()) && System.nanoTime() < deadline) {
+                queue.poll(50, TimeUnit.MILLISECONDS);
+                startThread.join(50);
+                shutdownThread.join(50);
+            }
+            assertFalse(startThread.isAlive(), "Не завершён тестовый start-поток");
+            assertFalse(shutdownThread.isAlive(), "Не завершён тестовый shutdown-поток");
+            service.shutdown();
+            assertFullyStopped(service, threads);
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void initialScanRuntimeFailureShouldFailStartWithOriginalCause() throws Exception {
+        IllegalStateException expected = new IllegalStateException("Unexpected scan failure");
+        FileScanner scanner = new FileScanner() {
+            @Override
+            public void scanFile(Path root, FileHandler handler) {
+                throw expected;
+            }
+        };
+        FileIndexerService service = new FileIndexerService(
+                1, tempDir, 3, 10, FileProcessor::process, scanner);
+        List<Thread> threads = ownedThreads(service);
+        try {
+            assertSame(expected, assertThrows(IllegalStateException.class, service::start));
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> service.getTermination().get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertSame(expected, failure.getCause());
+            assertFullyStopped(service, threads);
+        } finally {
+            service.shutdown();
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void workerRuntimeFailureWithFullQueueShouldFailStartAndStopService()
+            throws Exception {
+        Path first = Files.writeString(tempDir.resolve("first.md"), "first");
+        Path second = Files.writeString(tempDir.resolve("second.md"), "second");
+        Path third = Files.writeString(tempDir.resolve("third.md"), "third");
+        IllegalStateException expected = new IllegalStateException("Processor failed with full queue");
+        CountDownLatch processorEntered = new CountDownLatch(1);
+        CountDownLatch allowFailure = new CountDownLatch(1);
+        CountDownLatch thirdRouteStarted = new CountDownLatch(1);
+        AtomicReference<Throwable> startFailure = new AtomicReference<>();
+
+        FileScanner scanner = new FileScanner() {
+            @Override
+            public void scanFile(Path root, FileHandler handler)
+                    throws InterruptedException {
+                handler.handle(first);
+                processorEntered.await();
+                handler.handle(second); // Worker занят первым: второй занимает очередь.
+                thirdRouteStarted.countDown();
+                handler.handle(third); // Настоящий router.route() блокируется в put().
+            }
+        };
+        FileIndexerService service = new FileIndexerService(
+                1, tempDir, 3, 1, task -> {
+                    processorEntered.countDown();
+                    allowFailure.await();
+                    throw expected;
+                }, scanner
+        );
+        List<Thread> threads = ownedThreads(service);
+        Thread worker = threads.get(0);
+        Thread producer = threadField(service, "producerThread");
+        BlockingQueue<WorkerTask> queue = queuesOf(service).get(0);
+        CompletableFuture<Void> termination = service.getTermination();
+        Thread startThread = new Thread(() -> {
+            try {
+                service.start();
+            } catch (Throwable failure) {
+                startFailure.set(failure);
+            }
+        }, "FullQueueWorkerFailureStartTest");
+
+        try {
+            startThread.start();
+            assertTrue(thirdRouteStarted.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "Producer не начал отправку третьего файла");
+            // Один latch отмечает начало вызова, но ещё не доказывает блокировку.
+            // После сигнала у scanner нет других ожиданий, кроме put() третьей задачи.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+            while (producer.getState() != Thread.State.WAITING && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertEquals(Thread.State.WAITING, producer.getState(),
+                    "Producer должен ждать свободного места в очереди");
+            assertEquals(0, queue.remainingCapacity());
+            assertEquals(new FileTask(second, ChangeType.CREATED), queue.peek());
+
+            allowFailure.countDown();
+            startThread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+
+            assertFalse(startThread.isAlive(),
+                    "start() завис после падения Worker при заполненной очереди");
+            assertSame(expected, startFailure.get());
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> termination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertSame(expected, failure.getCause());
+            assertFullyStopped(service, threads);
+            for (String name : List.of("debounceExecutor", "rescanExecutor", "recoveryExecutor")) {
+                Field field = FileIndexerService.class.getDeclaredField(name);
+                field.setAccessible(true);
+                assertTrue(((ExecutorService) field.get(service)).isTerminated(),
+                        name + " остался работать после падения Worker");
+            }
+        } finally {
+            // Только уборка после проверок. Прерываем Producer до освобождения очереди,
+            // чтобы он не успел положить туда третий файл вместо StopTask.
+            allowFailure.countDown();
+            worker.interrupt();
+            producer.interrupt();
+            worker.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            producer.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            assertFalse(worker.isAlive(), "Тест не смог остановить Worker");
+            assertFalse(producer.isAlive(), "Тест не смог остановить Producer");
+            startThread.interrupt();
+            // У завершившегося Worker уже некому освободить место для StopTask.
+            // Разбираем его очередь только в уборке, чтобы красный тест не завис.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+            while (startThread.isAlive() && System.nanoTime() < deadline) {
+                queue.poll(50, TimeUnit.MILLISECONDS);
+                startThread.join(50);
+            }
+            assertFalse(startThread.isAlive(), "Тест не смог остановить start-поток");
+            service.shutdown();
+            assertFullyStopped(service, threads);
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void workerRuntimeFailureDuringInitialScanShouldFailStartAndStopService()
+            throws Exception {
+        Files.writeString(tempDir.resolve("note.md"), "content");
+        IllegalStateException expected = new IllegalStateException("Processor failed");
+        CountDownLatch processorEntered = new CountDownLatch(1);
+        AtomicReference<Throwable> startFailure = new AtomicReference<>();
+
+        // Одного файла и свободной очереди достаточно для проверки падения Worker.
+        // В finally останется место для StopTask даже у уже завершившегося Worker.
+        FileIndexerService service = new FileIndexerService(
+                1, tempDir, 3, 10, task -> {
+                    processorEntered.countDown();
+                    throw expected;
+                }
+        );
+        List<Thread> threads = ownedThreads(service);
+        CompletableFuture<Void> termination = service.getTermination();
+        Thread startThread = new Thread(() -> {
+            try {
+                service.start();
+            } catch (Throwable failure) {
+                startFailure.set(failure);
+            }
+        }, "WorkerFailureStartTest");
+
+        try {
+            startThread.start();
+            assertTrue(processorEntered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "Initial scan не передал файл процессору");
+
+            startThread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            assertFalse(startThread.isAlive(),
+                    "start() завис после RuntimeException в Worker");
+            assertSame(expected, startFailure.get(),
+                    "start() должен передать исходную ошибку процессора");
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> termination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertSame(expected, failure.getCause());
+            assertFullyStopped(service, threads);
+            for (String name : List.of("debounceExecutor", "rescanExecutor", "recoveryExecutor")) {
+                Field field = FileIndexerService.class.getDeclaredField(name);
+                field.setAccessible(true);
+                assertTrue(((ExecutorService) field.get(service)).isTerminated(),
+                        name + " остался работать после падения Worker");
+            }
+        } finally {
+            // Освобождаем start(), если текущая реализация зависла на barrier.
+            // Проверки выше уже выполнены: interruption здесь не считается успехом теста.
+            startThread.interrupt();
+            startThread.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            assertFalse(startThread.isAlive(), "Не удалось завершить тестовый start-поток");
+            service.shutdown();
+            assertFullyStopped(service, threads);
+        }
+    }
+
+    @Test
     @Timeout(10)
     void normalShutdownShouldCompleteServiceTerminationSuccessfully() throws Exception {
         FileIndexerService service = new FileIndexerService(2, tempDir, 3);
@@ -237,7 +567,7 @@ class FileIndexerServiceLifecycleTest {
                 .toAbsolutePath().normalize();
         CountDownLatch processorEntered = new CountDownLatch(1);
         CountDownLatch allowProcessing = new CountDownLatch(1);
-        CountDownLatch processingFinished = new CountDownLatch(1);
+        BarrierTask processingFinished = new BarrierTask(1);
 
         FileTaskProcessor processor = task -> {
             processorEntered.countDown();
@@ -253,7 +583,7 @@ class FileIndexerServiceLifecycleTest {
             service.start();
             BlockingQueue<WorkerTask> queue = queuesOf(service).get(0);
             queue.put(new FileTask(file, ChangeType.CREATED));
-            queue.put(new BarrierTask(processingFinished));
+            queue.put(processingFinished);
             assertTrue(processorEntered.await(2, TimeUnit.SECONDS),
                     "Worker не вошёл в процессор");
 
@@ -269,8 +599,7 @@ class FileIndexerServiceLifecycleTest {
             assertEquals(0, before.errorCount());
 
             allowProcessing.countDown();
-            assertTrue(processingFinished.await(2, TimeUnit.SECONDS),
-                    "Worker не дошёл до барьера после обработки файла");
+            processingFinished.getCompletionFuture().get(2, TimeUnit.SECONDS);
 
             FileIndexerSnapshot after = service.snapshot();
             assertEquals(java.util.Set.of(file), after.files().keySet());

@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -75,7 +76,8 @@ class IndexResilienceIntegrationTest {
                         filesStat,
                         fileIndex,
                         recoveryCoordinator,
-                        indexStateLock
+                        indexStateLock,
+                        new CompletableFuture<>()
                 ),
                 "ReconciliationWorkerTest"
         );
@@ -127,6 +129,7 @@ class IndexResilienceIntegrationTest {
         FileRecoveryCoordinator recoveryCoordinator =
                 recoveryCoordinator(recoveryScheduler, router);
         List<Thread> workers = new ArrayList<>();
+        CompletableFuture<Void> workerFailure = new CompletableFuture<>();
 
         for (int i = 0; i < STRESS_WORKER_COUNT; i++) {
             Thread worker = new Thread(
@@ -135,7 +138,8 @@ class IndexResilienceIntegrationTest {
                             filesStat,
                             fileIndex,
                             recoveryCoordinator,
-                            indexStateLock
+                            indexStateLock,
+                            workerFailure
                     ),
                     "StressWorker-" + i
             );

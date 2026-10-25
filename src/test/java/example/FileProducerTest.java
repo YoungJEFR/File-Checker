@@ -15,6 +15,10 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -38,6 +42,9 @@ class FileProducerTest {
         runAndJoin(producer);
 
         assertSame(expected, producer.getScanFailure());
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> producer.getCompletionFuture().get(1, TimeUnit.SECONDS));
+        assertSame(expected, failure.getCause());
         assertTrue(queue.isEmpty());
     }
 
@@ -55,6 +62,9 @@ class FileProducerTest {
         runAndJoin(producer);
 
         assertSame(expected, producer.getScanFailure());
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> producer.getCompletionFuture().get(1, TimeUnit.SECONDS));
+        assertSame(expected, failure.getCause());
         assertTrue(queue.isEmpty());
     }
 
@@ -73,12 +83,78 @@ class FileProducerTest {
         };
         FileProducer producer = new FileProducer(root, router, scanner);
 
+        CompletableFuture<Void> completion = producer.getCompletionFuture();
+        assertFalse(completion.isDone());
         runAndJoin(producer);
 
+        assertNull(completion.get(1, TimeUnit.SECONDS));
         assertNull(producer.getScanFailure());
         assertEquals(new FileTask(first, ChangeType.CREATED), queue.poll());
         assertEquals(new FileTask(second, ChangeType.CREATED), queue.poll());
         assertTrue(queue.isEmpty());
+    }
+
+    @Test
+    void runtimeFailureShouldCompleteFutureWithOriginalCause() throws Exception {
+        IllegalStateException expected = new IllegalStateException("Unexpected scanner failure");
+        FileProducer producer = new FileProducer(root, router, new FileScanner() {
+            @Override
+            public void scanFile(Path directory, FileHandler handler) {
+                throw expected;
+            }
+        });
+
+        runAndJoin(producer);
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> producer.getCompletionFuture().get(1, TimeUnit.SECONDS));
+        assertSame(expected, failure.getCause());
+        assertTrue(queue.isEmpty());
+    }
+
+    @Test
+    void interruptionShouldCompleteFutureAndRestoreInterruptFlag() throws Exception {
+        InterruptedException expected = new InterruptedException("Scan interrupted");
+        FileProducer producer = new FileProducer(root, router, new FileScanner() {
+            @Override
+            public void scanFile(Path directory, FileHandler handler) throws InterruptedException {
+                throw expected;
+            }
+        });
+        AtomicBoolean interruptRestored = new AtomicBoolean();
+        Thread thread = new Thread(() -> {
+            producer.run();
+            interruptRestored.set(Thread.currentThread().isInterrupted());
+        }, "InterruptedProducerTest");
+        try {
+            thread.start();
+            thread.join(2_000);
+            assertFalse(thread.isAlive());
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> producer.getCompletionFuture().get(1, TimeUnit.SECONDS));
+            assertSame(expected, failure.getCause());
+            assertTrue(interruptRestored.get());
+        } finally {
+            thread.interrupt();
+            thread.join(2_000);
+        }
+    }
+
+    @Test
+    void completingReturnedFutureShouldNotCompleteProducer() throws Exception {
+        FileProducer producer = new FileProducer(root, router, new FileScanner() {
+            @Override
+            public void scanFile(Path directory, FileHandler handler) {
+                // Пустое сканирование успешно завершится только после запуска Producer.
+            }
+        });
+        producer.getCompletionFuture().complete(null);
+        CompletableFuture<Void> actualCompletion = producer.getCompletionFuture();
+        assertFalse(actualCompletion.isDone());
+
+        runAndJoin(producer);
+
+        assertNull(actualCompletion.get(1, TimeUnit.SECONDS));
     }
 
     private static void runAndJoin(FileProducer producer) throws Exception {
