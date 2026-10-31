@@ -3,6 +3,7 @@ package org.example.reconciliation;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -12,6 +13,8 @@ public class DirectoryReconciliationService {
     private final DirectoryReconciler directoryReconciler;
     private final Object lifecycleLock = new Object();
     private boolean acceptingRequests = true;
+    private final CompletableFuture<Void> terminationFuture
+            = new CompletableFuture<>();
 
     private final ConcurrentHashMap<Path, ReconciliationStatus> reconciliationStatusMap
             = new ConcurrentHashMap<>();
@@ -74,6 +77,10 @@ public class DirectoryReconciliationService {
                 e.printStackTrace();
             } catch (UncheckedIOException e) {
                 e.printStackTrace();
+            } catch (RuntimeException e) {
+                reconciliationStatusMap.remove(directory);
+                terminationFuture.completeExceptionally(e);
+                return;
             }
 
             reconciliationStatusMap.compute(directory, (path, reconciliationStatus) -> {
@@ -89,5 +96,9 @@ public class DirectoryReconciliationService {
                 return;
             }
         }
+    }
+
+    public CompletableFuture<Void> getTerminationFuture() {
+        return terminationFuture.copy();
     }
 }

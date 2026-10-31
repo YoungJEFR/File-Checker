@@ -40,6 +40,69 @@ class FileWorkerTest {
 
     @Test
     @Timeout(10)
+    void runtimeFailureInRecoveryHandlerShouldCompleteWorkerFailureAndStopWorker()
+            throws Exception {
+        BlockingQueue<WorkerTask> queue = new ArrayBlockingQueue<>(1);
+        FileTask task = new FileTask(tempDir.resolve("notes.md"), ChangeType.MODIFIED);
+        IOException readFailure = new IOException("Cannot read file");
+        IllegalStateException recoveryFailure = new IllegalStateException("Recovery failed");
+        CompletableFuture<Void> workerFailure = new CompletableFuture<>();
+        CountDownLatch recoveryEntered = new CountDownLatch(1);
+        AtomicReference<FileTask> receivedTask = new AtomicReference<>();
+        AtomicReference<IOException> receivedCause = new AtomicReference<>();
+        AtomicReference<Throwable> uncaughtFailure = new AtomicReference<>();
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        FileRecoveryCoordinator recovery = new FileRecoveryCoordinator(
+                scheduler, new TaskRouter(List.of(queue)), 3, (failedTask, cause) -> { }
+        ) {
+            @Override
+            public boolean onFailure(FileTask failedTask, IOException cause) {
+                receivedTask.set(failedTask);
+                receivedCause.set(cause);
+                recoveryEntered.countDown();
+                throw recoveryFailure;
+            }
+        };
+        FileTaskProcessor processor = fileTask -> {
+            throw readFailure;
+        };
+        Thread worker = new Thread(new FileWorker(
+                queue, filesStat, fileIndex, recovery, processor,
+                indexStateLock, workerFailure
+        ), "RecoveryHandlerFailureTest");
+        worker.setUncaughtExceptionHandler((thread, cause) -> uncaughtFailure.set(cause));
+
+        try {
+            worker.start();
+            assertTrue(queue.offer(task, 2, TimeUnit.SECONDS));
+            assertTrue(recoveryEntered.await(2, TimeUnit.SECONDS),
+                    "Worker не вызвал обработчик восстановления");
+
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class,
+                    () -> workerFailure.get(2, TimeUnit.SECONDS)
+            );
+            assertSame(recoveryFailure, failure.getCause());
+            assertSame(task, receivedTask.get());
+            assertSame(readFailure, receivedCause.get());
+
+            worker.join(2_000);
+            assertFalse(worker.isAlive(), "Worker не завершился после RuntimeException");
+            assertNull(uncaughtFailure.get(), "Ошибка вышла за пределы run()");
+            assertTrue(fileIndex.snapshotMap().isEmpty());
+            assertEquals(0, filesStat.countFiles());
+            assertEquals(0, filesStat.totalBytes());
+        } finally {
+            worker.interrupt();
+            worker.join(2_000);
+            recovery.shutdown();
+            scheduler.shutdownNow();
+            assertTrue(scheduler.awaitTermination(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    @Timeout(10)
     void replacingIndexedFileWithDirectoryShouldRemoveEntryWithoutRecovery()
             throws Exception {
         Path file = Files.write(tempDir.resolve("notes.md"), new byte[10]);

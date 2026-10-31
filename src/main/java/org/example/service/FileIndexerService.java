@@ -193,7 +193,12 @@ public class FileIndexerService implements AutoCloseable {
             @Override
             public void run() {
                 try {
-                    fileWatcher.getTermination().get();
+                    CompletableFuture.anyOf(
+                            fileWatcher.getTermination(),
+                            workerFailure,
+                            reconciliationService.getTerminationFuture()
+                    ).get();
+
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     terminationFailure.compareAndSet(null, e);
@@ -345,8 +350,6 @@ public class FileIndexerService implements AutoCloseable {
     private void awaitInitialProcessing()
             throws InterruptedException {
         BarrierTask barrier = new BarrierTask(workers.length);
-
-
         try {
             for (int i = 0; i < workers.length; i++) {
 

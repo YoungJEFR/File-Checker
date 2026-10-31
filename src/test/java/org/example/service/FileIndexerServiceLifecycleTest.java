@@ -6,6 +6,7 @@ import org.example.pipeline.FileWorker;
 import org.example.processor.FileIndex;
 import org.example.processor.FileProcessor;
 import org.example.processor.FileTaskProcessor;
+import org.example.reconciliation.DirectoryReconciliationService;
 import org.example.watcher.FileWatcher;
 import org.example.watcher.WatchRegistrar;
 import org.junit.jupiter.api.RepeatedTest;
@@ -36,6 +37,138 @@ class FileIndexerServiceLifecycleTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    @Timeout(15)
+    void reconciliationFailureAfterSuccessfulPassShouldAutomaticallyStopService() throws Exception {
+        IllegalStateException expected = new IllegalStateException("Reconciliation failed after start");
+        AtomicBoolean failScan = new AtomicBoolean();
+        CountDownLatch failedScanEntered = new CountDownLatch(1);
+        FileScanner scanner = new FileScanner() {
+            @Override
+            public void scanFile(Path root, FileHandler handler)
+                    throws IOException, InterruptedException {
+                if (failScan.get()) {
+                    failedScanEntered.countDown();
+                    throw expected;
+                }
+                super.scanFile(root, handler);
+            }
+        };
+        FileIndexerService service = new FileIndexerService(
+                2, tempDir, 3, 10, FileProcessor::process, scanner
+        );
+        List<Thread> threads = ownedThreads(service);
+        Thread supervisor = threadField(service, "watcherSupervisorThread");
+        AtomicReference<Throwable> supervisorFailure = new AtomicReference<>();
+        supervisor.setUncaughtExceptionHandler((thread, failure) -> supervisorFailure.set(failure));
+        Field reconciliationField = FileIndexerService.class.getDeclaredField("reconciliationService");
+        reconciliationField.setAccessible(true);
+        DirectoryReconciliationService reconciliation =
+                (DirectoryReconciliationService) reconciliationField.get(service);
+        Field executorField = FileIndexerService.class.getDeclaredField("rescanExecutor");
+        executorField.setAccessible(true);
+        ExecutorService rescanExecutor = (ExecutorService) executorField.get(service);
+        CompletableFuture<Void> termination = service.getTermination();
+
+        try {
+            service.start();
+            assertEquals(FileIndexerState.RUNNING, stateOf(service));
+
+            reconciliation.request(tempDir);
+            // Контрольная задача в том же executor ожидает завершения успешной сверки.
+            rescanExecutor.submit(() -> { }).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertFalse(reconciliation.getTerminationFuture().isDone());
+            assertFalse(termination.isDone(), "Успешная сверка не должна останавливать сервис");
+            assertEquals(FileIndexerState.RUNNING, stateOf(service));
+
+            failScan.set(true);
+            reconciliation.request(tempDir);
+            assertTrue(failedScanEntered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "Сверка не дошла до тестовой ошибки сканирования");
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> termination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertSame(expected, failure.getCause(),
+                    "Сервис должен передать исходную ошибку сверки");
+            assertEquals(FileIndexerState.STOPPED, stateOf(service));
+            supervisor.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            assertFalse(supervisor.isAlive(), "Supervisor не завершился");
+            assertNull(supervisorFailure.get());
+            assertFullyStopped(service, threads);
+            for (String name : List.of("debounceExecutor", "rescanExecutor", "recoveryExecutor")) {
+                Field field = FileIndexerService.class.getDeclaredField(name);
+                field.setAccessible(true);
+                assertTrue(((ExecutorService) field.get(service)).isTerminated(),
+                        name + " остался работать после ошибки сверки");
+            }
+        } finally {
+            // Остановка в проверяемом сценарии должна произойти без вызова shutdown из теста.
+            service.shutdown();
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void workerFailureAfterStartShouldAutomaticallyStopService() throws Exception {
+        Path watched = Files.createDirectory(tempDir.resolve("watched"));
+        // Файл вне наблюдаемого дерева: задачу отправляет тест, а не WatchService.
+        Path file = Files.writeString(tempDir.resolve("problem.md"), "content")
+                .toAbsolutePath().normalize();
+        IllegalStateException expected = new IllegalStateException("Worker failed after start");
+        CountDownLatch processorEntered = new CountDownLatch(1);
+        AtomicReference<FileTask> receivedTask = new AtomicReference<>();
+        FileIndexerService service = new FileIndexerService(3, watched, 3, 10, task -> {
+            receivedTask.set(task);
+            processorEntered.countDown();
+            throw expected;
+        });
+        List<Thread> threads = ownedThreads(service);
+        Thread supervisor = threadField(service, "watcherSupervisorThread");
+        AtomicReference<Throwable> supervisorFailure = new AtomicReference<>();
+        supervisor.setUncaughtExceptionHandler((thread, failure) -> supervisorFailure.set(failure));
+        CompletableFuture<Void> termination = service.getTermination();
+
+        try {
+            service.start();
+            assertEquals(FileIndexerState.RUNNING, stateOf(service));
+            assertEquals(1L, processorEntered.getCount(),
+                    "Пустой initial scan не должен вызывать процессор");
+            assertFalse(termination.isDone());
+            assertTrue(supervisor.isAlive());
+
+            FileTask task = new FileTask(file, ChangeType.CREATED);
+            assertTrue(queuesOf(service).get(0).offer(task, 1, TimeUnit.SECONDS));
+            assertTrue(processorEntered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "Worker не получил задачу после запуска сервиса");
+            assertSame(task, receivedTask.get());
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> termination.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertSame(expected, failure.getCause(),
+                    "Сервис должен сохранить исходную ошибку Worker");
+            assertEquals(FileIndexerState.STOPPED, stateOf(service));
+            for (Thread thread : threads) {
+                if (thread != supervisor) {
+                    assertFalse(thread.isAlive(), thread.getName() + " остался работать");
+                }
+            }
+            for (String name : List.of("debounceExecutor", "rescanExecutor", "recoveryExecutor")) {
+                Field field = FileIndexerService.class.getDeclaredField(name);
+                field.setAccessible(true);
+                assertTrue(((ExecutorService) field.get(service)).isTerminated(),
+                        name + " остался работать после ошибки Worker");
+            }
+            // Supervisor публикует termination в конце shutdown(), перед выходом из run().
+            supervisor.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            assertFalse(supervisor.isAlive(), "Supervisor не завершился");
+            assertNull(supervisorFailure.get());
+            assertFullyStopped(service, threads);
+        } finally {
+            // До проверок shutdown не вызываем: остановка должна быть автоматической.
+            service.shutdown();
+        }
+    }
 
     @Test
     @Timeout(25)

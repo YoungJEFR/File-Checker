@@ -42,7 +42,8 @@ public class FileWorker implements Runnable {
         this.workerFailure = Objects.requireNonNull(
                 workerFailure,
                 "workerFailure must not be null"
-        );    }
+        );
+    }
 
 
     public FileWorker(
@@ -66,31 +67,61 @@ public class FileWorker implements Runnable {
 
     @Override
     public void run() {
-        while (true) {
-            WorkerTask workerTask;
+        try {
+            while (true) {
+                WorkerTask workerTask;
 
-            try {
-                workerTask = queue.take();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
+                try {
+                    workerTask = queue.take();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
 
-            if (workerTask instanceof StopTask) {
-                return;
-            }
+                if (workerTask instanceof StopTask) {
+                    return;
+                }
 
-            if (workerTask instanceof BarrierTask barrierTask) {
-                barrierTask.arrive();
-                continue;
-            }
+                if (workerTask instanceof BarrierTask barrierTask) {
+                    barrierTask.arrive();
+                    continue;
+                }
 
-            if (!(workerTask instanceof FileTask fileTask)) {
-                continue;
-            }
+                if (!(workerTask instanceof FileTask fileTask)) {
+                    continue;
+                }
 
-            try {
-                if (fileTask.changeType() == ChangeType.DELETED) {
+                try {
+                    if (fileTask.changeType() == ChangeType.DELETED) {
+                        deleteIndexInMap(
+                                fileIndex,
+                                fileTask,
+                                filesStat,
+                                fileRecoveryCoordinator,
+                                indexStateLock
+                        );
+
+                        continue;
+                    }
+
+                    if (fileTask.changeType() == ChangeType.CREATED || fileTask.changeType() == ChangeType.MODIFIED) {
+                        FileInfo newFile = fileTaskProcessor.process(fileTask);
+                        synchronized (indexStateLock) {
+                            FileInfo oldFile = fileIndex.addToMap(newFile);
+                            if (oldFile == null) {
+                                filesStat.fileAdded(newFile.fileSize());
+                            } else {
+                                long difference = newFile.fileSize() - oldFile.fileSize();
+                                filesStat.fileSizeChanged(difference);
+                            }
+                        }
+                    }
+
+                    fileRecoveryCoordinator.onSuccess(fileTask.path());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (NoSuchFileException | NotRegularFileException e) {
                     deleteIndexInMap(
                             fileIndex,
                             fileTask,
@@ -98,47 +129,19 @@ public class FileWorker implements Runnable {
                             fileRecoveryCoordinator,
                             indexStateLock
                     );
+                } catch (IOException e) {
+                    boolean recoveryStarted = fileRecoveryCoordinator.onFailure(fileTask, e);
 
-                    continue;
-                }
-
-                if (fileTask.changeType() == ChangeType.CREATED || fileTask.changeType() == ChangeType.MODIFIED) {
-                    FileInfo newFile = fileTaskProcessor.process(fileTask);
-                    synchronized (indexStateLock) {
-                        FileInfo oldFile = fileIndex.addToMap(newFile);
-                        if (oldFile == null) {
-                            filesStat.fileAdded(newFile.fileSize());
-                        } else {
-                            long difference = newFile.fileSize() - oldFile.fileSize();
-                            filesStat.fileSizeChanged(difference);
+                    if (recoveryStarted) {
+                        synchronized (indexStateLock) {
+                            filesStat.recordError();
                         }
                     }
                 }
-
-                fileRecoveryCoordinator.onSuccess(fileTask.path());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            } catch (NoSuchFileException | NotRegularFileException e) {
-                deleteIndexInMap(
-                        fileIndex,
-                        fileTask,
-                        filesStat,
-                        fileRecoveryCoordinator,
-                        indexStateLock
-                );
-            } catch (IOException e) {
-                boolean recoveryStarted = fileRecoveryCoordinator.onFailure(fileTask, e);
-
-                if (recoveryStarted) {
-                    synchronized (indexStateLock) {
-                        filesStat.recordError();
-                    }
-                }
-            } catch (RuntimeException e) {
-                workerFailure.completeExceptionally(e);
-                return;
             }
+        } catch (RuntimeException e) {
+            workerFailure.completeExceptionally(e);
+            return;
         }
     }
 

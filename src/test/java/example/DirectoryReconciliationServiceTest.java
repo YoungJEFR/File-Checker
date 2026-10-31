@@ -13,15 +13,16 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 class DirectoryReconciliationServiceTest {
 
@@ -39,6 +40,100 @@ class DirectoryReconciliationServiceTest {
     void stopExecutor() throws InterruptedException {
         executor.shutdownNow();
         executor.awaitTermination(2, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void successfulReconciliationShouldNotCompleteServiceFuture() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        CountDownLatch reconciliationTaskFinished = new CountDownLatch(1);
+        DirectoryReconciliationService service = service(directory ->
+                calls.incrementAndGet()
+        );
+        CompletableFuture<Void> failureSignal = service.getTerminationFuture();
+
+        assertFalse(failureSignal.isDone());
+
+        service.request(tempDir);
+        // В однопоточном executor эта задача начнётся после задачи сверки.
+        executor.submit(reconciliationTaskFinished::countDown);
+
+        assertTrue(reconciliationTaskFinished.await(2, TimeUnit.SECONDS),
+                "Задача сверки не завершилась");
+        assertEquals(1, calls.get(), "Сверка должна выполниться один раз");
+        assertFalse(failureSignal.isDone(),
+                "Успешная сверка не должна завершать future службы");
+        assertFalse(service.getTerminationFuture().isDone(),
+                "Внутренний future службы должен оставаться незавершённым");
+    }
+
+    @Test
+    void runtimeFailureShouldPublishOriginalCauseAndRemoveDirectoryStatus() throws Exception {
+        IllegalStateException expected = new IllegalStateException("Reconciliation failed");
+        DirectoryReconciliationService service = service(directory -> {
+            throw expected;
+        });
+        CompletableFuture<Void> failureSignal = service.getTerminationFuture();
+
+        service.request(tempDir);
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> failureSignal.get(2, TimeUnit.SECONDS));
+        assertSame(expected, failure.getCause());
+        awaitExecutor();
+        assertTrue(statusesOf(service).isEmpty(),
+                "После аварии не должно оставаться статуса RUNNING");
+    }
+
+    @Test
+    void runtimeFailureShouldDiscardRequestedAdditionalPass() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        CountDownLatch firstPassStarted = new CountDownLatch(1);
+        CountDownLatch allowFailure = new CountDownLatch(1);
+        IllegalStateException expected = new IllegalStateException("Active pass failed");
+        DirectoryReconciliationService service = service(directory -> {
+            calls.incrementAndGet();
+            firstPassStarted.countDown();
+            allowFailure.await();
+            throw expected;
+        });
+
+        try {
+            service.request(tempDir);
+            assertTrue(firstPassStarted.await(2, TimeUnit.SECONDS));
+            service.request(tempDir);
+            service.request(tempDir);
+            assertTrue(statusesOf(service).containsKey(tempDir.toAbsolutePath().normalize()));
+
+            allowFailure.countDown();
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> service.getTerminationFuture().get(2, TimeUnit.SECONDS));
+            assertSame(expected, failure.getCause());
+            awaitExecutor();
+            assertEquals(1, calls.get(), "После аварии повторный проход запускаться не должен");
+            assertTrue(statusesOf(service).isEmpty(),
+                    "После аварии не должно оставаться статуса RUNNING_AGAIN");
+        } finally {
+            allowFailure.countDown();
+        }
+    }
+
+    @Test
+    void completingFutureCopyShouldNotHideLaterReconciliationFailure() throws Exception {
+        IllegalStateException expected = new IllegalStateException("Reconciliation failed");
+        DirectoryReconciliationService service = service(directory -> {
+            throw expected;
+        });
+        CompletableFuture<Void> externalCopy = service.getTerminationFuture();
+        assertTrue(externalCopy.complete(null));
+        CompletableFuture<Void> actualSignal = service.getTerminationFuture();
+        assertFalse(actualSignal.isDone(), "Внешний код не должен завершать внутренний future");
+
+        service.request(tempDir);
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> actualSignal.get(2, TimeUnit.SECONDS));
+        assertSame(expected, failure.getCause());
+        assertNull(externalCopy.get(2, TimeUnit.SECONDS));
     }
 
     @Test
@@ -143,6 +238,8 @@ class DirectoryReconciliationServiceTest {
         awaitExecutor();
 
         assertEquals(2, calls.get());
+        assertFalse(service.getTerminationFuture().isDone(),
+                "Обработанная IOException не должна считаться аварией службы");
     }
 
     @Test
@@ -250,6 +347,17 @@ class DirectoryReconciliationServiceTest {
         service.request(tempDir);
         awaitExecutor();
         assertEquals(2, calls.get());
+        assertFalse(service.getTerminationFuture().isDone(),
+                "Обработанная UncheckedIOException не должна считаться аварией службы");
+    }
+
+    private static Map<?, ?> statusesOf(
+            DirectoryReconciliationService service
+    ) throws ReflectiveOperationException {
+        Field field = DirectoryReconciliationService.class
+                .getDeclaredField("reconciliationStatusMap");
+        field.setAccessible(true);
+        return Map.copyOf((Map<?, ?>) field.get(service));
     }
 
     private DirectoryReconciliationService service(
