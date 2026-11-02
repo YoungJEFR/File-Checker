@@ -71,8 +71,12 @@ public class FileWatcher implements Runnable {
 
                     if (kind == StandardWatchEventKinds.ENTRY_CREATE
                             && Files.isDirectory(fullPath)) {
-                        watchRegistrar.registerRecursively(fullPath, watcher);
-                        requestRescan(fullPath);
+                        try {
+                            watchRegistrar.registerRecursively(fullPath, watcher);
+                            requestRescan(fullPath);
+                        } catch (NoSuchFileException e) {
+                            reconciliationService.request(directory);
+                        }
                         continue;
                     } else if (kind == StandardWatchEventKinds.ENTRY_DELETE) {
                         reconciliationService.request(directory);
@@ -163,7 +167,7 @@ public class FileWatcher implements Runnable {
             startupFailure = e;
             termination.completeExceptionally(e);
         } finally {
-        watcherReady.countDown();
+            watcherReady.countDown();
             termination.complete(null);
         }
     }

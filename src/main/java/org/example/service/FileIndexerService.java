@@ -439,9 +439,7 @@ public class FileIndexerService implements AutoCloseable {
         recoveryExecutor.shutdownNow();
 
         if (!recoveryExecutor.awaitTermination(1, TimeUnit.SECONDS)) {
-            System.err.println(
-                    "Recovery executor не удалось завершить"
-            );
+           throw new IllegalStateException("Scheduled не смог завершится");
         }
     }
 
@@ -473,40 +471,66 @@ public class FileIndexerService implements AutoCloseable {
                         stopWatcher();
                     } catch (InterruptedException e) {
                         wasInterrupted = true;
+                    } catch (RuntimeException e) {
+                        recordTerminationFailure(e);
                     }
 
                     try {
                         stopProducer();
                     } catch (InterruptedException e) {
                         wasInterrupted = true;
+                    } catch (RuntimeException e) {
+                        recordTerminationFailure(e);
                     }
 
-                    reconciliationService.shutdown();
-                    fileRecoveryCoordinator.shutdown();
-                    debounce.shutdown();
+                    try {
+                        reconciliationService.shutdown();
+                    } catch (RuntimeException e) {
+                        recordTerminationFailure(e);
+                    }
+
+                    try {
+                        fileRecoveryCoordinator.shutdown();
+                    } catch (RuntimeException e) {
+                        recordTerminationFailure(e);
+                    }
+
+                    try {
+                        debounce.shutdown();
+                    } catch (RuntimeException e) {
+                        recordTerminationFailure(e);
+                    }
 
                     try {
                         stopExecutor(debounceExecutor);
                     } catch (InterruptedException e) {
                         wasInterrupted = true;
+                    } catch (RuntimeException e) {
+                        recordTerminationFailure(e);
                     }
 
                     try {
                         stopExecutor(rescanExecutor);
                     } catch (InterruptedException e) {
                         wasInterrupted = true;
+                    } catch (RuntimeException e) {
+                        recordTerminationFailure(e);
                     }
 
                     try {
                         cancelScheduledRecoveries();
                     } catch (InterruptedException e) {
                         wasInterrupted = true;
+                    } catch (RuntimeException e) {
+                        recordTerminationFailure(e);
                     }
 
                     try {
                         stopWorkers();
                     } catch (InterruptedException e) {
                         wasInterrupted = true;
+                    } catch (RuntimeException e) {
+                        recordTerminationFailure(e);
                     }
 
                 } finally {
@@ -521,6 +545,8 @@ public class FileIndexerService implements AutoCloseable {
                 awaitSupervisorTermination();
             } catch (InterruptedException e) {
                 wasInterrupted = true;
+            } catch (RuntimeException e) {
+                recordTerminationFailure(e);
             }
 
             if (performCleanup) {
@@ -534,6 +560,16 @@ public class FileIndexerService implements AutoCloseable {
 
             if (wasInterrupted) {
                 Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void recordTerminationFailure(RuntimeException e) {
+        boolean terminationFlag = terminationFailure.compareAndSet(null, e);
+        if (!terminationFlag) {
+            Throwable cause = terminationFailure.get();
+            if (cause != e) {
+                cause.addSuppressed(e);
             }
         }
     }
@@ -609,7 +645,10 @@ public class FileIndexerService implements AutoCloseable {
         }
 
         if (!termination) {
-            System.err.println(executor.getClass().getSimpleName() + " не завершился.");
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+            throw new IllegalStateException("Executor не может завершится");
         }
 
         if (wasInterrupted) {
